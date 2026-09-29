@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PBF Map Optimizer & Tool Setup</title>
+    <hta:application 
+        id="pbfOpt" 
+        applicationname="PBFOptimizer" 
+        border="dialog" 
+        maximizebutton="no" 
+        scroll="yes" 
+        singleinstance="yes" />
+        
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #eef2f5;
+            color: #333;
+            font-size: 14px;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background-color: #fff;
+            border: 1px solid #ccc;
+            padding: 20px;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.05);
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+        h2 { margin-top: 0; font-size: 18px; border-bottom: 2px solid #0078D7; padding-bottom: 10px; color: #0078D7; }
+        .form-group { margin-bottom: 15px; }
+        label { font-weight: bold; display: block; margin-bottom: 5px; }
+        select, input[type="text"], input[type="file"] { width: 100%; padding: 6px; box-sizing: border-box; border: 1px solid #ccc; }
+        .readonly-field { background-color: #f5f5f5; color: #0078D7; font-weight: bold; cursor: text; }
+        .checkbox-group { margin-bottom: 20px; background: #f9f9f9; padding: 15px; border: 1px solid #e0e0e0; }
+        .checkbox-item { margin-bottom: 12px; }
+        .checkbox-item input { margin-right: 10px; }
+        .desc { font-size: 12px; color: #666; margin-left: 25px; display: block; }
+        .coord-inputs { margin-left: 25px; margin-top: 10px; display: none; }
+        .coord-inputs input { width: 80px; margin-right: 10px; margin-bottom: 5px; }
+        .btn-run { 
+            background-color: #0078D7; color: white; border: none; 
+            padding: 12px 20px; font-size: 14px; cursor: pointer; font-weight: bold; width: 100%;
+            border-radius: 3px; transition: background 0.2s;
+        }
+        .btn-run:hover { background-color: #005A9E; }
+        .btn-install { background-color: #28a745; }
+        .btn-install:hover { background-color: #218838; }
+        .alert { font-size: 12px; color: #d9534f; margin-top: 15px; text-align: center; }
+    </style>
+
+    <script language="VBScript">
+        Sub Window_OnLoad
+            Window.ResizeTo 600, 920
+            ToggleSource() ' Initialize fields
+        End Sub
+
+        Sub ToggleSource
+            Dim sel, urlField, fileField
+            sel = document.getElementById("cboSource").value
+            
+            ' FIX: Added the 'Set' keyword required by VBScript for object assignment
+            Set urlField = document.getElementById("txtDownloadUrl")
+            Set fileField = document.getElementById("txtExpectedFile")
+
+            If sel = "local" Then
+                document.getElementById("divLocalZip").style.display = "block"
+                document.getElementById("divRemoteOpts").style.display = "none"
+                fileField.value = "osmium-osmconvert-bundle.zip"
+                urlField.value = "N/A (Local File)"
+            Else
+                document.getElementById("divLocalZip").style.display = "none"
+                document.getElementById("divRemoteOpts").style.display = "block"
+                
+                If sel = "mirror1" Then
+                    urlField.value = "https://github.com/osmcode/osmium-tool/releases/latest/download/osmium-tool-win.zip"
+                    fileField.value = "osmium-tool-win.zip"
+                ElseIf sel = "mirror2" Then
+                    urlField.value = "https://wambachers-osm.website/tools/osmium-osmconvert-win.zip"
+                    fileField.value = "osmium-osmconvert-win.zip"
+                ElseIf sel = "mirror3" Then
+                    urlField.value = "https://dist.geofabrik.de/osm-tools-windows.zip"
+                    fileField.value = "osm-tools-windows.zip"
+                End If
+            End If
+        End Sub
+
+        Sub ToggleBBox
+            If document.getElementById("chkBox").checked Then
+                document.getElementById("divBBox").style.display = "block"
+            Else
+                document.getElementById("divBBox").style.display = "none"
+            End If
+        End Sub
+
+        Sub InstallTools
+            Dim fso, shell, vbsPath, batPath, vbsScript, batScript
+            Set fso = CreateObject("Scripting.FileSystemObject")
+            Set shell = CreateObject("WScript.Shell")
+            
+            Dim sourceOpt, zipPath, downloadUrl, expectedFile
+            sourceOpt = document.getElementById("cboSource").value
+            expectedFile = document.getElementById("txtExpectedFile").value
+            downloadUrl = document.getElementById("txtDownloadUrl").value
+            
+            If sourceOpt = "local" Then
+                zipPath = document.getElementById("inFileZip").value
+                If zipPath = "" Then
+                    MsgBox "Please select a local ZIP file containing the OSM tools.", 48, "Missing File"
+                    Exit Sub
+                End If
+            End If
+            
+            Dim tempFolder
+            tempFolder = shell.ExpandEnvironmentStrings("%TEMP%")
+            vbsPath = tempFolder & "\install_osm_tools.vbs"
+            batPath = tempFolder & "\install_osm_tools.bat"
+            
+            ' 1. Generate the purely native VBScript Installer
+            Set vbsScript = fso.CreateTextFile(vbsPath, True)
+            vbsScript.WriteLine "On Error Resume Next"
+            vbsScript.WriteLine "Set fso = CreateObject(""Scripting.FileSystemObject"")"
+            vbsScript.WriteLine "Set shell = CreateObject(""WScript.Shell"")"
+            vbsScript.WriteLine "targetDir = shell.ExpandEnvironmentStrings(""%USERPROFILE%"") & ""\OSM_Tools"""
+            vbsScript.WriteLine "If Not fso.FolderExists(targetDir) Then fso.CreateFolder(targetDir)"
+            
+            If sourceOpt = "local" Then
+                vbsScript.WriteLine "zipPath = """ & zipPath & """"
+            Else
+                vbsScript.WriteLine "zipPath = shell.ExpandEnvironmentStrings(""%TEMP%"") & ""\" & expectedFile & """"
+                vbsScript.WriteLine "WScript.Echo ""Downloading tools from: " & downloadUrl & """"
+                vbsScript.WriteLine "Set xmlHttp = CreateObject(""MSXML2.XMLHTTP"")"
+                vbsScript.WriteLine "xmlHttp.Open ""GET"", """ & downloadUrl & """, False"
+                vbsScript.WriteLine "xmlHttp.Send"
+                vbsScript.WriteLine "If xmlHttp.Status = 200 Then"
+                vbsScript.WriteLine "    Set objStream = CreateObject(""ADODB.Stream"")"
+                vbsScript.WriteLine "    objStream.Open"
+                vbsScript.WriteLine "    objStream.Type = 1" ' adTypeBinary
+                vbsScript.WriteLine "    objStream.Write xmlHttp.ResponseBody"
+                vbsScript.WriteLine "    objStream.SaveToFile zipPath, 2" ' adSaveCreateOverWrite
+                vbsScript.WriteLine "    objStream.Close"
+                vbsScript.WriteLine "    WScript.Echo ""Download complete."""
+                vbsScript.WriteLine "Else"
+                vbsScript.WriteLine "    WScript.Echo ""ERROR: Download failed. HTTP Status: "" & xmlHttp.Status"
+                vbsScript.WriteLine "    WScript.Quit 1"
+                vbsScript.WriteLine "End If"
+            End If
+            
+            vbsScript.WriteLine "WScript.Echo ""Extracting ZIP archive..."""
+            vbsScript.WriteLine "Set objShellApp = CreateObject(""Shell.Application"")"
+            vbsScript.WriteLine "Set destFolder = objShellApp.NameSpace(targetDir)"
+            vbsScript.WriteLine "Set zipItems = objShellApp.NameSpace(zipPath).Items"
+            vbsScript.WriteLine "If Not zipItems Is Nothing Then"
+            vbsScript.WriteLine "    destFolder.CopyHere zipItems, 4 ' 4 = Do not display a progress dialog box"
+            vbsScript.WriteLine "End If"
+            
+            ' Extract root EXEs (flattening if they are in a subfolder)
+            vbsScript.WriteLine "WScript.Echo ""Flattening executable files..."""
+            vbsScript.WriteLine "Sub FlattenFolder(folderPath)"
+            vbsScript.WriteLine "    Set curFolder = fso.GetFolder(folderPath)"
+            vbsScript.WriteLine "    For Each file In curFolder.Files"
+            vbsScript.WriteLine "        If LCase(fso.GetExtensionName(file.Name)) = ""exe"" And LCase(folderPath) <> LCase(targetDir) Then"
+            vbsScript.WriteLine "            fso.CopyFile file.Path, targetDir & ""\"" & file.Name, True"
+            vbsScript.WriteLine "        End If"
+            vbsScript.WriteLine "    Next"
+            vbsScript.WriteLine "    For Each subFolder In curFolder.SubFolders"
+            vbsScript.WriteLine "        FlattenFolder(subFolder.Path)"
+            vbsScript.WriteLine "    Next"
+            vbsScript.WriteLine "End Sub"
+            vbsScript.WriteLine "FlattenFolder(targetDir)"
+            
+            vbsScript.WriteLine "WScript.Echo ""Adding to User PATH environment variable..."""
+            vbsScript.WriteLine "Set env = shell.Environment(""User"")"
+            vbsScript.WriteLine "userPath = env(""PATH"")"
+            vbsScript.WriteLine "If InStr(1, userPath, targetDir, 1) = 0 Then"
+            vbsScript.WriteLine "    env(""PATH"") = userPath & "";"" & targetDir"
+            vbsScript.WriteLine "    WScript.Echo ""Successfully added OSM_Tools to PATH."""
+            vbsScript.WriteLine "Else"
+            vbsScript.WriteLine "    WScript.Echo ""Directory is already in PATH."""
+            vbsScript.WriteLine "End If"
+
+            If sourceOpt <> "local" Then
+                vbsScript.WriteLine "If fso.FileExists(zipPath) Then fso.DeleteFile zipPath"
+            End If
+
+            vbsScript.Close
+            
+            ' 2. Generate the Wrapper Batch Script to keep the console visible
+            Set batScript = fso.CreateTextFile(batPath, True)
+            batScript.WriteLine "@echo off"
+            batScript.WriteLine "echo ========================================"
+            batScript.WriteLine "echo OSM Tools Installer (Native VBScript)"
+            batScript.WriteLine "echo ========================================"
+            batScript.WriteLine "cscript.exe //Nologo """ & vbsPath & """"
+            batScript.WriteLine "echo."
+            batScript.WriteLine "echo ========================================"
+            batScript.WriteLine "echo INSTALLATION COMPLETE!"
+            batScript.WriteLine "echo Close this window and RESTART the HTA so it detects the new PATH."
+            batScript.WriteLine "echo ========================================"
+            batScript.WriteLine "pause"
+            batScript.Close
+            
+            ' Run the Batch Wrapper
+            shell.Run """" & batPath & """", 1, False
+        End Sub
+
+        Sub RunOptimization
+            Dim fso, shell, batPath, batFile
+            Set fso = CreateObject("Scripting.FileSystemObject")
+            Set shell = CreateObject("WScript.Shell")
+
+            Dim inFile, outFolder, outFile
+            inFile = document.getElementById("inFile").value
+            outFile = document.getElementById("outFile").value
+
+            If inFile = "" Or outFile = "" Then
+                MsgBox "Please select an input file and specify an output filename.", 48, "Missing Information"
+                Exit Sub
+            End If
+
+            outFolder = fso.GetParentFolderName(inFile)
+            batPath = outFolder & "\run_optimization.bat"
+            Set batFile = fso.CreateTextFile(batPath, True)
+
+            batFile.WriteLine "@echo off"
+            batFile.WriteLine "echo ========================================"
+            batFile.WriteLine "echo PBF Map Optimizer Started"
+            batFile.WriteLine "echo ========================================"
+            batFile.WriteLine "cd /d """ & outFolder & """"
+
+            Dim currentIn, stepNum
+            currentIn = inFile
+            stepNum = 1
+
+            If document.getElementById("chkBox").checked Then
+                Dim minLon, minLat, maxLon, maxLat, bbox
+                minLon = document.getElementById("txtMinLon").value
+                minLat = document.getElementById("txtMinLat").value
+                maxLon = document.getElementById("txtMaxLon").value
+                maxLat = document.getElementById("txtMaxLat").value
+                
+                If minLon = "" Or minLat = "" Or maxLon = "" Or maxLat = "" Then
+                    MsgBox "Please fill in all 4 bounding box coordinates.", 48, "Missing Coordinates"
+                    batFile.Close
+                    fso.DeleteFile(batPath)
+                    Exit Sub
+                End If
+
+                bbox = minLon & "," & minLat & "," & maxLon & "," & maxLat
+                Dim tmp1
+                tmp1 = "temp_step1.pbf"
+
+                batFile.WriteLine "echo."
+                batFile.WriteLine "echo Step " & stepNum & ": Extracting Bounding Box (" & bbox & ")..."
+                batFile.WriteLine "osmium extract -b " & bbox & " """ & currentIn & """ -o """ & tmp1 & """ -O"
+                batFile.WriteLine "if %errorlevel% neq 0 goto :error"
+                currentIn = tmp1
+                stepNum = stepNum + 1
+            End If
+
+            If document.getElementById("chkTags").checked Then
+                Dim tmp2
+                tmp2 = "temp_step2.pbf"
+                batFile.WriteLine "echo."
+                batFile.WriteLine "echo Step " & stepNum & ": Filtering Tags (Keeping only Roads, Land, Water, Parks)..."
+                batFile.WriteLine "osmium tags-filter -t """ & currentIn & """ nw/highway nw/natural nw/waterway nw/landuse nw/leisure -o """ & tmp2 & """ -O"
+                batFile.WriteLine "if %errorlevel% neq 0 goto :error"
+                currentIn = tmp2
+                stepNum = stepNum + 1
+            End If
+
+            If document.getElementById("chkMeta").checked Then
+                batFile.WriteLine "echo."
+                batFile.WriteLine "echo Step " & stepNum & ": Stripping Historical Metadata..."
+                batFile.WriteLine "osmconvert """ & currentIn & """ --drop-version --drop-author -o=""" & outFile & """"
+                batFile.WriteLine "if %errorlevel% neq 0 goto :error"
+            Else
+                batFile.WriteLine "echo."
+                batFile.WriteLine "echo Saving final output..."
+                batFile.WriteLine "copy /Y """ & currentIn & """ """ & outFile & """"
+            End If
+
+            batFile.WriteLine "echo."
+            batFile.WriteLine "echo Cleaning up temporary files..."
+            batFile.WriteLine "if exist temp_step1.pbf del temp_step1.pbf"
+            batFile.WriteLine "if exist temp_step2.pbf del temp_step2.pbf"
+            
+            batFile.WriteLine "echo."
+            batFile.WriteLine "echo ========================================"
+            batFile.WriteLine "echo SUCCESS! Optimized map saved as: " & outFile
+            batFile.WriteLine "echo ========================================"
+            batFile.WriteLine "pause"
+            batFile.WriteLine "exit"
+
+            batFile.WriteLine ":error"
+            batFile.WriteLine "echo."
+            batFile.WriteLine "echo [!] AN ERROR OCCURRED! See the output above."
+            batFile.WriteLine "echo Ensure 'osmium' and 'osmconvert' are successfully installed and in your PATH."
+            batFile.WriteLine "pause"
+
+            batFile.Close
+
+            shell.Run """" & batPath & """", 1, False
+        End Sub
+    </script>
+</head>
+<body>
+    
+    <div class="container">
+        <h2>1. OSM Command Line Tools Setup</h2>
+        <div class="form-group">
+            <label>Installation Source</label>
+            <select id="cboSource" onchange="ToggleSource()">
+                <option value="mirror1">Mirror 1: GitHub Official Release</option>
+                <option value="mirror2">Mirror 2: Wambachers EU Archive</option>
+                <option value="mirror3">Mirror 3: Geofabrik Tools Mirror</option>
+                <option value="local">Install from local ZIP file...</option>
+            </select>
+        </div>
+        
+        <div id="divRemoteOpts">
+            <div class="form-group">
+                <label>Download URL (Copy to manually download):</label>
+                <input type="text" id="txtDownloadUrl" class="readonly-field">
+            </div>
+            <div class="form-group">
+                <label>Expected File Name:</label>
+                <input type="text" id="txtExpectedFile" class="readonly-field" readonly>
+            </div>
+        </div>
+
+        <div class="form-group" id="divLocalZip" style="display:none;">
+            <label>Select Local ZIP containing OSM .exe binaries:</label>
+            <input type="file" id="inFileZip" accept=".zip">
+        </div>
+
+        <button class="btn-run btn-install" onclick="InstallTools()">Install Tools & Add to PATH</button>
+        <span class="desc" style="margin-left:0; margin-top:10px;">Downloads via Native VBScript, extracts binaries to %USERPROFILE%\OSM_Tools, and permanently adds the directory to your User Environment PATH.</span>
+    </div>
+
+    <div class="container">
+        <h2>2. Optimize Map Geometry</h2>
+        
+        <div class="form-group">
+            <label>Source PBF File (e.g. canada-latest.osm.pbf)</label>
+            <input type="file" id="inFile" accept=".pbf">
+        </div>
+
+        <div class="form-group">
+            <label>Output Filename</label>
+            <input type="text" id="outFile" value="optimized_baremetal.pbf">
+        </div>
+
+        <label>Optimization Pipeline Steps:</label>
+        <div class="checkbox-group">
+            <div class="checkbox-item">
+                <input type="checkbox" id="chkBox" onclick="ToggleBBox()"> <b>1. Extract Bounding Box</b>
+                <span class="desc">Crops the massive map to a specific region before processing.</span>
+                <div id="divBBox" class="coord-inputs">
+                    <input type="text" id="txtMinLon" placeholder="Min Lon">
+                    <input type="text" id="txtMinLat" placeholder="Min Lat">
+                    <input type="text" id="txtMaxLon" placeholder="Max Lon">
+                    <input type="text" id="txtMaxLat" placeholder="Max Lat">
+                </div>
+            </div>
+
+            <div class="checkbox-item">
+                <input type="checkbox" id="chkTags" checked> <b>2. Filter Required Tags Only</b>
+                <span class="desc">Drops 60% of file size by removing buildings, POIs, fences, and power lines. Keeps only standard Win32 viewer tags (highways, natural, etc).</span>
+            </div>
+
+            <div class="checkbox-item">
+                <input type="checkbox" id="chkMeta" checked> <b>3. Strip Historical Metadata</b>
+                <span class="desc">Drops another 15% by removing node author names, timestamps, and version history using osmconvert.</span>
+            </div>
+        </div>
+
+        <button class="btn-run" onclick="RunOptimization()">Generate & Run Batch Pipeline</button>
+    </div>
+</body>
+</html>
