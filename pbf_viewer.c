@@ -16,6 +16,7 @@
 #include <math.h>
 #include <shellapi.h> 
 #include <ctype.h>
+#include <zlib.h>
 #define WIRETYPE_VARINT 0
 #define WIRETYPE_64BIT  1
 #define WIRETYPE_LENGTH 2
@@ -173,6 +174,136 @@ bool IsNodeNeeded(uint64_t id) {
         else right = mid - 1;
     }
     return false;
+}
+void LoadBmfData(const char* filepath) {
+    char path[1024] = {0};
+    size_t len = strlen(filepath);
+    if (len >= 2 && filepath[0] == '"' && filepath[len - 1] == '"') {
+        strncpy(path, filepath + 1, len - 2);
+    } else {
+        strncpy(path, filepath, sizeof(path) - 1);
+    }
+
+    FILE* in = fopen(path, "rb");
+    if (!in) {
+        MessageBox(NULL, "Could not open map file.", "Error", MB_ICONERROR);
+        return;
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, in) != 4) { fclose(in); return; }
+
+    uint8_t* ram_buffer = NULL;
+    uint64_t ram_size = 0;
+    uint64_t bytes_read = 0;
+
+    // Detect Zlib Compressed BMFZ Header
+    if (strncmp(magic, "BMFZ", 4) == 0) {
+        uint64_t uncompressed_size;
+        fread(&uncompressed_size, 8, 1, in);
+        
+        ram_buffer = malloc((size_t)uncompressed_size);
+        if (!ram_buffer) {
+            MessageBox(NULL, "Out of memory. Cannot decompress BMFZ.", "Error", MB_ICONERROR);
+            fclose(in); return;
+        }
+
+        z_stream strm = {0};
+        inflateInit(&strm);
+
+        uint8_t z_chunk[262144];
+        do {
+            strm.avail_in = fread(z_chunk, 1, sizeof(z_chunk), in);
+            if (ferror(in)) break;
+            if (strm.avail_in == 0) break;
+            strm.next_in = z_chunk;
+            do {
+                strm.avail_out = uncompressed_size - strm.total_out;
+                strm.next_out = ram_buffer + strm.total_out;
+                inflate(&strm, Z_NO_FLUSH);
+            } while (strm.avail_out == 0);
+        } while (!feof(in));
+
+        ram_size = strm.total_out;
+        inflateEnd(&strm);
+        fclose(in);
+        
+        // Verify decompressed format
+        if (strncmp((char*)ram_buffer, "BMF2", 4) != 0) {
+            free(ram_buffer);
+            return;
+        }
+        bytes_read = 4; 
+    } 
+    else if (strncmp(magic, "BMF2", 4) == 0) {
+        // Uncompressed Memory Mapped Read
+        fseek(in, 0, SEEK_END);
+        ram_size = ftell(in);
+        fseek(in, 0, SEEK_SET);
+
+        ram_buffer = malloc((size_t)ram_size);
+        fread(ram_buffer, 1, ram_size, in);
+        fclose(in);
+        bytes_read = 4;
+    } else {
+        fclose(in); return;
+    }
+
+    uint64_t bmf_count;
+    memcpy(&bmf_count, ram_buffer + bytes_read, 8);
+    bytes_read += 8;
+    
+    if (g_FeatureCount + bmf_count >= g_FeatureCapacity) {
+        g_FeatureCapacity = g_FeatureCount + bmf_count + 1000;
+        g_MapFeatures = (MapFeature*)realloc(g_MapFeatures, g_FeatureCapacity * sizeof(MapFeature));
+    }
+
+    for (uint64_t i = 0; i < bmf_count; i++) {
+        MapFeature* f = &g_MapFeatures[g_FeatureCount++];
+        
+        f->feature_class = ram_buffer[bytes_read];
+        bytes_read += 1;
+
+        uint16_t nlen;
+        memcpy(&nlen, ram_buffer + bytes_read, 2);
+        bytes_read += 2;
+        if (nlen > 0) {
+            f->name = (char*)malloc(nlen + 1);
+            memcpy(f->name, ram_buffer + bytes_read, nlen);
+            f->name[nlen] = '\0';
+            bytes_read += nlen;
+        } else f->name = NULL;
+
+        uint16_t plen;
+        memcpy(&plen, ram_buffer + bytes_read, 2);
+        bytes_read += 2;
+        if (plen > 0) {
+            f->postcode = (char*)malloc(plen + 1);
+            memcpy(f->postcode, ram_buffer + bytes_read, plen);
+            f->postcode[plen] = '\0';
+            bytes_read += plen;
+        } else f->postcode = NULL;
+
+        uint32_t pcnt;
+        memcpy(&pcnt, ram_buffer + bytes_read, 4);
+        bytes_read += 4;
+        
+        f->point_count = pcnt;
+        f->points = (MapPoint*)malloc(pcnt * sizeof(MapPoint));
+        memcpy(f->points, ram_buffer + bytes_read, pcnt * sizeof(MapPoint));
+        bytes_read += pcnt * sizeof(MapPoint);
+        
+        f->refs = NULL;
+        f->min_lon = 180.0; f->max_lon = -180.0;
+        f->min_lat = 90.0;  f->max_lat = -90.0;
+        for (uint32_t p = 0; p < pcnt; p++) {
+            if (f->points[p].lon < f->min_lon) f->min_lon = f->points[p].lon;
+            if (f->points[p].lon > f->max_lon) f->max_lon = f->points[p].lon;
+            if (f->points[p].lat < f->min_lat) f->min_lat = f->points[p].lat;
+            if (f->points[p].lat > f->max_lat) f->max_lat = f->points[p].lat;
+        }
+    }
+    free(ram_buffer);
 }
 /* ==========================================================================
  * 2. HELPERS & SEARCH ENGINE
@@ -2018,7 +2149,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 /* ==========================================================================
- * 7. PROGRAM ENTRY
+ * REPLACE THIS FUNCTION: 7. PROGRAM ENTRY (WinMain)
  * ========================================================================== */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
@@ -2116,14 +2247,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             
             char* token = strtok(tempMaps, ", ");
             while (token) {
-                LoadPbfData(token);
+                if (strstr(token, ".bmf") || strstr(token, ".BMF")) {
+                    LoadBmfData(token);
+                } else {
+                    LoadPbfData(token);
+                }
                 token = strtok(NULL, ", ");
             }
             if (g_SelectedPinCount >= 2) CalculateRoute();
         }
     } else if (strlen(lpCmdLine) > 0) {
         strcpy(g_MapFilesStr, lpCmdLine);
-        LoadPbfData(lpCmdLine);
+        if (strstr(lpCmdLine, ".bmf") || strstr(lpCmdLine, ".BMF")) {
+            LoadBmfData(lpCmdLine);
+        } else {
+            LoadPbfData(lpCmdLine);
+        }
     } 
 
     WNDCLASSA wcd = {0};
