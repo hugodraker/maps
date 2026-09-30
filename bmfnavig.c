@@ -1377,7 +1377,7 @@ void DrawMap(HDC hdc, int w, int h) {
     FillRect(hdc, &(RECT){0, 0, w, h}, bgOceanBrush);
     DeleteObject(bgOceanBrush);
 
-    if (g_FeatureCount == 0 && g_ActiveBmfCount == 0) {
+    if (g_ActiveBmfCount == 0 && g_FeatureCount == 0) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(0, 50, 150));
         SetTextAlign(hdc, TA_CENTER | TA_BASELINE);
@@ -1404,7 +1404,7 @@ void DrawMap(HDC hdc, int w, int h) {
     double vp_max_lat = fmax(fmax(t1, t2), fmax(t3, t4));
 
     static POINT* screen_pts = NULL;
-    static int screen_pts_cap = 0;
+    static uint32_t screen_pts_cap = 0;
     static RECT drawn_labels[4000]; 
     int label_cnt = 0;
 
@@ -1445,7 +1445,7 @@ void DrawMap(HDC hdc, int w, int h) {
                 if (!g_ShowHwyMain || f->feature_class != CLASS_HWY_MAIN) continue;
             } else if (pass == 6) {
                 if (i == (uint64_t)g_HighlightedFeature) {
-                    // Highlight rendering
+                    // Highlight rendering flag
                 } else {
                     if (!g_ShowLabels) continue;
                     if (f->feature_class == CLASS_HWY_MAIN && g_Zoom < 200.0) continue;
@@ -1454,33 +1454,30 @@ void DrawMap(HDC hdc, int w, int h) {
                 }
             }
 
-            if ((uint32_t)f->point_count > (uint32_t)screen_pts_cap) {
+            if (f->point_count > screen_pts_cap) {
                 screen_pts_cap = f->point_count + 1024;
                 screen_pts = (POINT*)realloc(screen_pts, screen_pts_cap * sizeof(POINT));
             }
 
-            uint32_t step = 1;
-            if (f->point_count > 4000) {
-                step = f->point_count / 4000;
-                if (step < 1) step = 1;
-            }
-
             uint32_t pt_idx = 0;
-            for (uint32_t j = 0; j < f->point_count; j += step) {
+            int last_px = -999999, last_py = -999999;
+            
+            for (uint32_t j = 0; j < f->point_count; j++) {
                 double px, py;
                 LatLonToScreen(f->points[j].lon, f->points[j].lat, w, h, &px, &py);
-                screen_pts[pt_idx].x = (int)px;
-                screen_pts[pt_idx].y = (int)py;
-                pt_idx++;
+                int ipx = (int)px;
+                int ipy = (int)py;
+                
+                if (j == 0 || j == f->point_count - 1 || abs(ipx - last_px) >= 2 || abs(ipy - last_py) >= 2) {
+                    screen_pts[pt_idx].x = ipx;
+                    screen_pts[pt_idx].y = ipy;
+                    pt_idx++;
+                    last_px = ipx;
+                    last_py = ipy;
+                }
             }
             
-            if (is_closed && (f->point_count - 1) % step != 0) {
-                double px, py;
-                LatLonToScreen(f->points[f->point_count-1].lon, f->points[f->point_count-1].lat, w, h, &px, &py);
-                screen_pts[pt_idx].x = (int)px;
-                screen_pts[pt_idx].y = (int)py;
-                pt_idx++;
-            }
+            if (pt_idx < 2) continue;
             
             if (pass == 6) {
                 if (i == (uint64_t)g_HighlightedFeature) {
@@ -1568,7 +1565,7 @@ void DrawMap(HDC hdc, int w, int h) {
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
         SelectObject(hdc, routePen);
         
-        if (g_RoutePathCount > screen_pts_cap) {
+        if ((uint32_t)g_RoutePathCount > screen_pts_cap) {
             screen_pts_cap = g_RoutePathCount + 1024;
             screen_pts = (POINT*)realloc(screen_pts, screen_pts_cap * sizeof(POINT));
         }
