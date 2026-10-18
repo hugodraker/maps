@@ -1514,11 +1514,12 @@ static void CalculateRouteForPins(
                 PFeat* feat = &feats[f];
                 if (feat->fc != CLASS_HWY_MAIN && feat->fc != CLASS_HWY_MINOR) continue;
                 if (long_route && feat->fc == CLASS_HWY_MINOR) {
-                    // On long routes (>350km), keep minor roads only near the start and destination pins
-                    double f_cx = (feat->min_lon + feat->max_lon) * 0.5, f_cy = (feat->min_lat + feat->max_lat) * 0.5;
-                    double dA = (f_cx - pA->lon)*(f_cx - pA->lon) + (f_cy - pA->lat)*(f_cy - pA->lat);
-                    double dB = (f_cx - pB->lon)*(f_cx - pB->lon) + (f_cy - pB->lat)*(f_cy - pB->lat);
-                    if (dA > 0.04 && dB > 0.04) continue;
+                    // Check if start/end pins are within ~0.2 deg of the minor road's bounding box (not just its center)
+                    bool nearA = (pA->lon >= feat->min_lon - 0.2 && pA->lon <= feat->max_lon + 0.2 &&
+                                  pA->lat >= feat->min_lat - 0.2 && pA->lat <= feat->max_lat + 0.2);
+                    bool nearB = (pB->lon >= feat->min_lon - 0.2 && pB->lon <= feat->max_lon + 0.2 &&
+                                  pB->lat >= feat->min_lat - 0.2 && pB->lat <= feat->max_lat + 0.2);
+                    if (!nearA && !nearB) continue;
                 }
                 if (feat->max_lon < bb_min_lon || feat->min_lon > bb_max_lon || feat->max_lat < bb_min_lat || feat->min_lat > bb_max_lat) continue;
                 
@@ -1550,12 +1551,24 @@ static void CalculateRouteForPins(
 
         int start_id = -1, end_id = -1;
         float min_d_start = 1e30f, min_d_end = 1e30f;
+        int start_main_id = -1, end_main_id = -1;
+        float min_d_start_main = 1e30f, min_d_end_main = 1e30f;
+
         for(uint32_t i=0; i<rn_cnt; i++) {
             float ds = (rnodes[i].lon - pA->lon)*(rnodes[i].lon - pA->lon) + (rnodes[i].lat - pA->lat)*(rnodes[i].lat - pA->lat);
             if(ds < min_d_start) { min_d_start = ds; start_id = i; }
             float de = (rnodes[i].lon - pB->lon)*(rnodes[i].lon - pB->lon) + (rnodes[i].lat - pB->lat)*(rnodes[i].lat - pB->lat);
             if(de < min_d_end) { min_d_end = de; end_id = i; }
+
+            if (rnodes[i].fc == CLASS_HWY_MAIN) {
+                if (ds < min_d_start_main) { min_d_start_main = ds; start_main_id = i; }
+                if (de < min_d_end_main) { min_d_end_main = de; end_main_id = i; }
+            }
         }
+
+        // Prefer snapping to a main highway if one is reasonably close (within ~10km) to avoid disconnected minor road islands
+        if (start_main_id != -1 && (long_route || min_d_start_main < 0.01f)) start_id = start_main_id;
+        if (end_main_id != -1 && (long_route || min_d_end_main < 0.01f)) end_id = end_main_id;
 
         if (start_id == -1 || end_id == -1) { free(snodes); free(rnodes); continue; }
 
@@ -1609,8 +1622,8 @@ static void CalculateRouteForPins(
                 }
             }
 
-            // Lower-bound binary search with float-safe junction tolerance (2e-4 deg)
-            const float eps = 2e-4f;
+            // Relaxed junction tolerance (1e-3 deg ~ 100m) so decimated roads still connect across intersections
+            const float eps = 1e-3f;
             float target_lon = rnodes[u].lon - eps;
             int lo = 0, hi = (int)rn_cnt;
             while (lo < hi) {
@@ -3113,7 +3126,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     InitializeCriticalSection(&g_FileCS);
     for (int i = 0; i < LRU_SIZE; i++) g_LRU[i].chunk_idx = -1;
 
-    char initMaps[4096] = {0};FILE* ini = fopen("qjmnavig.ini", "r");
+    char initMaps[4096] = {0}; FILE* ini = fopen("qjmnavig.ini", "r");
     if (ini) {
         char line[8192];
         while (fgets(line, sizeof(line), ini)) {
@@ -3144,13 +3157,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         } fclose(ini);
     }
     
+    bool is_cli_route = (lpCmdLine && strstr(lpCmdLine, "long:") != NULL);
+
     if (lpCmdLine && strlen(lpCmdLine) > 0) {
         char* p = lpCmdLine;
         while (*p == ' ') p++;
         if (strncmp(p, "-e", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
             g_EditMode = true; p += 2; while (*p == ' ') p++;
         }
-        if (*p && strstr(p, "long:") == NULL) {
+        if (*p && !is_cli_route) {
             char cleanCmd[4096] = {0}; strncpy(cleanCmd, p, 4095);
             if (cleanCmd[0] == '"') {
                 size_t len = strlen(cleanCmd); if (cleanCmd[len-1] == '"') cleanCmd[len-1] = '\0'; memmove(cleanCmd, cleanCmd + 1, strlen(cleanCmd));
@@ -3159,13 +3174,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    WNDCLASSA wc = {0};wc.lpfnWndProc = NavigWndProc; wc.hInstance = hInstance; wc.style = CS_DBLCLKS; wc.lpszClassName = "QjmnavigClass";
+    // If invoked from CLI with pins=..., synchronously load maps and copy route without racing the background thread
+    if (is_cli_route) {
+        if (strlen(initMaps) > 0) {
+            char maps_copy[4096];
+            strncpy(maps_copy, initMaps, sizeof(maps_copy) - 1);
+            maps_copy[sizeof(maps_copy) - 1] = '\0';
+            char* token = strtok(maps_copy, "|");
+            while (token) {
+                char* ext = strrchr(token, '.');
+                if (ext && (strcasecmp(ext, ".qjm") == 0 || strcasecmp(ext, ".qjmc") == 0)) {
+                    LoadQJMData(token);
+                }
+                token = strtok(NULL, "|");
+            }
+        }
+        CopyRouteDistanceToClipboard(lpCmdLine);
+        DeleteCriticalSection(&g_FileCS);
+        ReleaseMutex(hMutex); CloseHandle(hMutex);
+        return 0;
+    }
+
+    WNDCLASSA wc = {0}; wc.lpfnWndProc = NavigWndProc; wc.hInstance = hInstance; wc.style = CS_DBLCLKS; wc.lpszClassName = "QjmnavigClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassA(&wc);
 
-    WNDCLASSA wcl = {0};wcl.lpfnWndProc = LegendWndProc; wcl.hInstance = hInstance; wcl.lpszClassName = "QjmLegendClass";
+    WNDCLASSA wcl = {0}; wcl.lpfnWndProc = LegendWndProc; wcl.hInstance = hInstance; wcl.lpszClassName = "QjmLegendClass";
     wcl.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassA(&wcl);
 
-    WNDCLASSA wcd = {0};wcd.lpfnWndProc = PdfWndProc; wcd.hInstance = hInstance; wcd.lpszClassName = "PdfDialogClass";
+    WNDCLASSA wcd = {0}; wcd.lpfnWndProc = PdfWndProc; wcd.hInstance = hInstance; wcd.lpszClassName = "PdfDialogClass";
     wcd.hbrBackground = (HBRUSH)(COLOR_WINDOW); wcd.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassA(&wcd);
 
     g_IsLoading = (strlen(initMaps) > 0 || g_WorldMapFile[0] != '\0');
@@ -3189,11 +3225,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    if (lpCmdLine && strstr(lpCmdLine, "long:") != NULL) {
-        CopyRouteDistanceToClipboard(lpCmdLine);
-    }
-
-    MSG msg = {0};while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    MSG msg = {0}; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     ReleaseMutex(hMutex); CloseHandle(hMutex);
     return 0;
 }
