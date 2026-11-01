@@ -379,7 +379,6 @@ static void ClosePolylineAndAddNode(int c_idx, int f_idx, int node1, int node2) 
 
     PFeat* feats = (PFeat*)(data + 12);
     PFeat* f = &feats[f_idx];
-    if (f->pt_cnt >= 65530) return;
     if (node1 < 0 || (uint32_t)node1 >= f->pt_cnt || node2 < 0 || (uint32_t)node2 >= f->pt_cnt) return;
 
     if (node1 > node2) {
@@ -434,7 +433,6 @@ static void ClosePolylineAndAddNode(int c_idx, int f_idx, int node1, int node2) 
     g_MapModified = true;
     RecalcFeatureAndChunkBounds(c_idx, f_idx);
 }
-
 static void DeleteFeature(int c_idx, int f_idx) {
     uint8_t* data = EnsureChunkEditable(c_idx);
     if (!data) return;
@@ -585,7 +583,6 @@ static void InsertNodeInFeature(int c_idx, int f_idx, int after_node) {
 
     PFeat* feats = (PFeat*)(data + 12);
     PFeat* f = &feats[f_idx];
-    if (f->pt_cnt >= 65530) return;
     if (after_node < 0 || (uint32_t)after_node >= f->pt_cnt) after_node = f->pt_cnt - 1;
 
     float* old_pts = (float*)(data + 12 + f_cnt * sizeof(PFeat));
@@ -594,7 +591,6 @@ static void InsertNodeInFeature(int c_idx, int f_idx, int after_node) {
         new_lon = (float)g_PendingInsertLon;
         new_lat = (float)g_PendingInsertLat;
     } else if (!f->is_area && (uint32_t)after_node == f->pt_cnt - 1 && f->pt_cnt >= 2) {
-        // Extrapolate slightly past the end of an open polyline instead of wrapping to node 0
         float lon1 = old_pts[f->pt_off + (after_node - 1) * 2], lat1 = old_pts[f->pt_off + (after_node - 1) * 2 + 1];
         float lon2 = old_pts[f->pt_off + after_node * 2],       lat2 = old_pts[f->pt_off + after_node * 2 + 1];
         new_lon = lon2 + (lon2 - lon1) * 0.25f;
@@ -646,7 +642,6 @@ static void InsertNodeInFeature(int c_idx, int f_idx, int after_node) {
     g_MapModified = true;
     RecalcFeatureAndChunkBounds(c_idx, f_idx);
 }
-
 // IMPORTANT: Replace the existing DeleteNodeInFeature AND SaveEditedQJM functions with these corrected versions.
 // 1. DeleteNodeInFeature had a severe structural bug that corrupted the chunk memory layout when saving.
 // 2. SaveEditedQJM now explicitly unlocks thread mutexes, clears the LRU cache, and forcibly unloads all handles (including world maps) before writing.
@@ -1037,8 +1032,8 @@ static void DrawOverlay(HDC hdc, int w, int h) {
 
                 // Inline projection math constants
                 int canvas_w = w * 3, canvas_h = h * 3;
-                double half_cw = canvas_w * 0.5 + g_PanX;
-                double half_ch = canvas_h * 0.5 + g_PanY;
+                double half_cw = canvas_w * 0.5 + g_CanvasPanX;
+                double half_ch = canvas_h * 0.5 + g_CanvasPanY;
                 double off_x = half_cw - g_CenterLon * g_Zoom;
                 double off_y = half_ch + g_CenterLat * g_Zoom;
                 double dpan_x = g_PanX - g_CanvasPanX;
@@ -1514,7 +1509,6 @@ static void CalculateRouteForPins(
                 PFeat* feat = &feats[f];
                 if (feat->fc != CLASS_HWY_MAIN && feat->fc != CLASS_HWY_MINOR) continue;
                 if (long_route && feat->fc == CLASS_HWY_MINOR) {
-                    // Check if start/end pins are within ~0.2 deg of the minor road's bounding box (not just its center)
                     bool nearA = (pA->lon >= feat->min_lon - 0.2 && pA->lon <= feat->max_lon + 0.2 &&
                                   pA->lat >= feat->min_lat - 0.2 && pA->lat <= feat->max_lat + 0.2);
                     bool nearB = (pB->lon >= feat->min_lon - 0.2 && pB->lon <= feat->max_lon + 0.2 &&
@@ -1566,9 +1560,22 @@ static void CalculateRouteForPins(
             }
         }
 
-        // Prefer snapping to a main highway if one is reasonably close (within ~10km) to avoid disconnected minor road islands
-        if (start_main_id != -1 && (long_route || min_d_start_main < 0.01f)) start_id = start_main_id;
-        if (end_main_id != -1 && (long_route || min_d_end_main < 0.01f)) end_id = end_main_id;
+        // Fix: The previous squared degree threshold (0.01f) was pulling perfectly placed local pins
+        // onto distant main roads up to ~11km away due to an aggressive fallback heuristic.
+        // We now use real Haversine distance and only aggressively snap to a main highway on 
+        // long cross-country routes, or if the main highway is extremely close (< 50m) locally.
+        if (start_main_id != -1) {
+            float dist_start_main = Haversine(pA->lat, pA->lon, rnodes[start_main_id].lat, rnodes[start_main_id].lon);
+            if ((long_route && dist_start_main < 5.0f) || (!long_route && dist_start_main < 0.05f)) {
+                start_id = start_main_id;
+            }
+        }
+        if (end_main_id != -1) {
+            float dist_end_main = Haversine(pB->lat, pB->lon, rnodes[end_main_id].lat, rnodes[end_main_id].lon);
+            if ((long_route && dist_end_main < 5.0f) || (!long_route && dist_end_main < 0.05f)) {
+                end_id = end_main_id;
+            }
+        }
 
         if (start_id == -1 || end_id == -1) { free(snodes); free(rnodes); continue; }
 
@@ -1622,7 +1629,6 @@ static void CalculateRouteForPins(
                 }
             }
 
-            // Relaxed junction tolerance (1e-3 deg ~ 100m) so decimated roads still connect across intersections
             const float eps = 1e-3f;
             float target_lon = rnodes[u].lon - eps;
             int lo = 0, hi = (int)rn_cnt;
@@ -1745,7 +1751,6 @@ static void CalculateRouteForPins(
     }
     LeaveCriticalSection(&g_FileCS);
 }
-
 static void CalculateRoute(void) {
     if (g_RoutePath) { free(g_RoutePath); g_RoutePath = NULL; }
     if (g_RouteSteps) { free(g_RouteSteps); g_RouteSteps = NULL; }
@@ -2387,12 +2392,11 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
                             PFeat* f = &feats[g_HighlightedFeat];
 
-                            if (f->pt_cnt < 65530) {
+                            if (f->pt_cnt > 0) {
                                 double min_d2 = 1e30;
                                 int best_seg = 0;
                                 double best_lon = center_lon, best_lat = center_lat;
                                 
-                                // Added spatial tolerance filter (roughly 50 pixels in lat/lon space)
                                 double pick_tol = 50.0 / g_Zoom;
 
                                 for (uint32_t j = 0; j < f->pt_cnt; j++) {
@@ -2402,7 +2406,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                     float lon1 = points[f->pt_off + j*2], lat1 = points[f->pt_off + j*2 + 1];
                                     float lon2 = points[f->pt_off + next_j*2], lat2 = points[f->pt_off + next_j*2 + 1];
 
-                                    // Spatial Culling: Skip segments entirely out of range of the mouse pointer
                                     float min_lon = lon1 < lon2 ? lon1 : lon2;
                                     float max_lon = lon1 > lon2 ? lon1 : lon2;
                                     float min_lat = lat1 < lat2 ? lat1 : lat2;
@@ -2413,7 +2416,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                         continue;
                                     }
 
-                                    // Only calculate projection if the segment is near the cursor
                                     double px1, py1, px2, py2;
                                     NavLatLonToCanvasScreen(lon1, lat1, rc.right, rc.bottom, &px1, &py1);
                                     NavLatLonToCanvasScreen(lon2, lat2, rc.right, rc.bottom, &px2, &py2);
@@ -2442,7 +2444,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                 InsertNodeInFeature(g_HighlightedChunk, g_HighlightedFeat, best_seg);
                                 g_PendingInsertSeg = -1;
 
-                                // Explicitly select the newly inserted node so it's ready to drag
                                 g_SelectedNode = best_seg + 1;
                                 g_SelectedNode2 = -1;
                             }
@@ -2633,7 +2634,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
                 bool handled = false;
 
-                // 1. FAST PATH: Check currently highlighted feature first
                 if (g_HighlightedChunk != -1 && g_HighlightedFeat != -1 && 
                     (uint32_t)g_HighlightedChunk < g_ChunkCount) {
                     uint8_t* data = GetChunkData(g_HighlightedChunk);
@@ -2647,12 +2647,10 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             if (IsFeatureVisible((uint32_t)g_HighlightedChunk, f, g_Zoom)) {
                                 double pick_tol = 50.0 / g_Zoom;
 
-                                // 1. Check for clicking an existing node
                                 for (uint32_t j = 0; j < f->pt_cnt; j++) {
                                     float n_lon = points[f->pt_off + j*2];
                                     float n_lat = points[f->pt_off + j*2 + 1];
                                     
-                                    // Spatial Culling
                                     if (c_lon < n_lon - pick_tol || c_lon > n_lon + pick_tol ||
                                         c_lat < n_lat - pick_tol || c_lat > n_lat + pick_tol) continue;
 
@@ -2673,9 +2671,8 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                     }
                                 }
 
-                                // 2. Check for clicking a segment to insert a new node
-                                if (!handled && f->pt_cnt < 65530) {
-                                    double best_d2 = 225.0; // 15-pixel threshold for edge/polyline interaction
+                                if (!handled && f->pt_cnt > 0) {
+                                    double best_d2 = 225.0;
                                     int best_seg = -1;
                                     double best_lon = c_lon, best_lat = c_lat;
 
@@ -2686,7 +2683,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                                         float lon1 = points[f->pt_off + j*2], lat1 = points[f->pt_off + j*2 + 1];
                                         float lon2 = points[f->pt_off + next_j*2], lat2 = points[f->pt_off + next_j*2 + 1];
 
-                                        // Spatial Culling
                                         float min_lon = lon1 < lon2 ? lon1 : lon2;
                                         float max_lon = lon1 > lon2 ? lon1 : lon2;
                                         float min_lat = lat1 < lat2 ? lat1 : lat2;
@@ -2729,7 +2725,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     }
                 }
 
-                // 2. GENERAL PATH
                 if (!handled) {
                     double pick_tol = 16.0 / g_Zoom;
                     double best_scr_d = 144.0;
@@ -2813,9 +2808,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             points[f->pt_off + g_SelectedNode * 2] = (float)final_lon;
                             points[f->pt_off + g_SelectedNode * 2 + 1] = (float)final_lat;
 
-                            // OPTIMIZATION: Do not recalculate bounds or flag the heavy background canvas 
-                            // to be redrawn (g_CanvasDirty = true) on every single mouse frame during a drag. 
-                            // This ensures the DrawOverlay cache architecture works.
                             InvalidateRect(hwnd, NULL, FALSE);
                         }
                     }
@@ -2831,9 +2823,11 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         g_Rotation += dx * 0.008;
                         g_CanvasDirty = true;
                     } else {
-                        g_PanX += dx; g_PanY += dy;
+                        g_PanX += dx; 
+                        g_PanY += dy;
                     }
-                    g_LastMousePos.x = mx; g_LastMousePos.y = my;
+                    g_LastMousePos.x = mx; 
+                    g_LastMousePos.y = my;
                     InvalidateRect(hwnd, NULL, FALSE);
                 }
             }
@@ -2845,7 +2839,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 g_DraggingNode = false;
                 ReleaseCapture();
 
-                // OPTIMIZATION: Finalize bounds and redraw the background canvas only once the drag is complete
                 if (g_HighlightedChunk != -1 && g_HighlightedFeat != -1) {
                     RecalcFeatureAndChunkBounds(g_HighlightedChunk, g_HighlightedFeat);
                 }
