@@ -1,8 +1,12 @@
 /* ============================================================================
  * qjmnavig - QJM Map Navigator & Editor
  * gcc -O3 -m32 -mwindows -Wall -Wextra qjmnavig.c -o qjmnavig.exe -lcomdlg32 -lgdi32 -lws2_32 -Wl,--large-address-aware
+ *
+ *  2026 HUGO
+ *
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
-
 #define BUILD_NAVIGATOR
 #include "qjm.h"
 #include "qjmhttpd.h"
@@ -2515,7 +2519,7 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam); RECT rc; GetClientRect(hwnd, &rc);
             bool pin_deleted = false;
             for (int i = 0; i < g_PinCount; i++) {
-                double px, py; NavLatLonToCanvasScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, &px, &py);
+                double px, py; NavLatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
                 if (abs(mx - (int)px) <= 16 && (my - (int)py) >= -38 && (my - (int)py) <= 8) {
                     int sel_idx = -1; for (int k = 0; k < g_SelectedPinCount; k++) { if (g_SelectedPins[k] == i) sel_idx = k; }
                     if (sel_idx >= 0) { for (int k = sel_idx; k < g_SelectedPinCount - 1; k++) g_SelectedPins[k] = g_SelectedPins[k+1]; g_SelectedPinCount--; }
@@ -2853,7 +2857,7 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam); RECT rect; GetClientRect(hwnd, &rect);
                     bool hit_pin = false;
                     for (int i = 0; i < g_PinCount; i++) {
-                        double px, py; NavLatLonToCanvasScreen(g_Pins[i].lon, g_Pins[i].lat, rect.right, rect.bottom, &px, &py);
+                        double px, py; NavLatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rect.right, rect.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
                         if (abs(mx - (int)px) <= 16 && (my - (int)py) >= -38 && (my - (int)py) <= 8) { 
                             bool already_sel = false; for(int k=0; k<g_SelectedPinCount; k++) { if(g_SelectedPins[k] == i) already_sel = true; }
                             if (!already_sel && g_SelectedPinCount < 1000) { g_SelectedPins[g_SelectedPinCount++] = i; CalculateRoute(); }
@@ -2958,13 +2962,45 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_LBUTTONDBLCLK: {
             if (hEditPin) FinishPinEdit(hwnd);
             if (g_EditMode && g_HighlightedChunk != -1 && g_HighlightedFeat != -1) {
-                InsertNodeInFeature(g_HighlightedChunk, g_HighlightedFeat, g_SelectedNode);
+                int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam);
+                RECT rc; GetClientRect(hwnd, &rc);
+
+                EnterCriticalSection(&g_FileCS);
+                uint8_t* data = GetChunkData(g_HighlightedChunk);
+                if (data) {
+                    uint32_t f_cnt = *(uint32_t*)data;
+                    if ((uint32_t)g_HighlightedFeat < f_cnt) {
+                        PFeat* feats = (PFeat*)(data + 12);
+                        float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
+                        PFeat* f = &feats[g_HighlightedFeat];
+
+                        double best_d2 = 256.0; // 16 pixels tolerance squared
+                        int best_node = -1;
+
+                        for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                            double px, py;
+                            NavLatLonToCanvasScreen(points[f->pt_off + j*2], points[f->pt_off + j*2 + 1], rc.right, rc.bottom, &px, &py);
+                            double d2 = (px - mx) * (px - mx) + (py - my) * (py - my);
+                            if (d2 < best_d2) {
+                                best_d2 = d2;
+                                best_node = (int)j;
+                            }
+                        }
+
+                        if (best_node != -1) {
+                            g_SelectedNode = best_node;
+                            InsertNodeInFeature(g_HighlightedChunk, g_HighlightedFeat, g_SelectedNode);
+                        }
+                    }
+                }
+                LeaveCriticalSection(&g_FileCS);
+
                 g_CanvasDirty = true; InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
             int mx = (short)LOWORD(lParam), my = (short)HIWORD(lParam); RECT rc; GetClientRect(hwnd, &rc); bool hit_pin = false;
             for (int i = 0; i < g_PinCount; i++) {
-                double px, py; NavLatLonToCanvasScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, &px, &py);
+                double px, py; NavLatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
                 if (abs(mx - (int)px) <= 16 && (my - (int)py) >= -38 && (my - (int)py) <= 8) {
                     g_EditingPinIndex = i; hEditPin = CreateWindowExA(0, "EDIT", g_Pins[i].name, WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, (int)px - 50, (int)py - 55, 100, 20, hwnd, (HMENU)99, NULL, NULL);
                     OldEditProc = (WNDPROC)SetWindowLongPtr(hEditPin, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc); SetFocus(hEditPin); SendMessage(hEditPin, EM_SETSEL, 0, -1); InvalidateRect(hwnd, NULL, FALSE); hit_pin = true; break;
@@ -3032,6 +3068,19 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     EnterCriticalSection(&g_FileCS);
                     DrawOverlay(g_hdcScreen, w, h);
                     LeaveCriticalSection(&g_FileCS);
+
+                    if (g_ChunkCount == 0 && !g_IsLoading) {
+                        SetBkMode(g_hdcScreen, TRANSPARENT);
+                        SetTextColor(g_hdcScreen, RGB(0, 50, 150));
+                        SetTextAlign(g_hdcScreen, TA_CENTER | TA_BASELINE);
+                        
+                        HFONT hFont = CreateFont(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+                        HFONT hOldFont = (HFONT)SelectObject(g_hdcScreen, hFont);
+                        const char* prompt = "Drag QJM map here to load.";
+                        TextOutA(g_hdcScreen, w / 2, h / 2, prompt, strlen(prompt));
+                        SelectObject(g_hdcScreen, hOldFont);
+                        DeleteObject(hFont);
+                    }
 
                     BitBlt(hdc, 0, 0, w, h, g_hdcScreen, 0, 0, SRCCOPY);
                 }

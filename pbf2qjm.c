@@ -6,6 +6,10 @@
  *
  * gcc -O3 -m32 -mwindows -Wall -Wextra pbf2qjm.c -o pbf2qjm.exe -lcomdlg32 -lgdi32 -lshell32
  *
+ *  2026 HUGO
+ *
+ * THIS WORK IS NOT FIT FOR ANY FUNCTION OR PURPOSE, COMES WITH NO WARRANTY,
+ * AND IS BEING RELEASED INTO THE PUBLIC DOMAIN.
  * ============================================================================ */
 
 #include "qjm.h"
@@ -55,6 +59,50 @@ static bool IsPointInPolygon(double lon, double lat, WayNode* poly, uint32_t cou
         }
     }
     return inside;
+}
+
+static bool IsPointInWaterPolys(double lon, double lat, AccumWay* water_polys, uint32_t water_poly_cnt) {
+    for (uint32_t i = 0; i < water_poly_cnt; i++) {
+        if (water_polys[i].count < 3) continue;
+        if (IsPointInPolygon(lon, lat, water_polys[i].nodes, water_polys[i].count)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsPolygonMostlyWater(WayNode* poly, uint32_t count, AccumWay* water_polys, uint32_t water_poly_cnt) {
+    if (count < 3 || water_poly_cnt == 0) return false;
+
+    double min_x = 180.0, max_x = -180.0, min_y = 90.0, max_y = -90.0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (poly[i].lon < min_x) min_x = poly[i].lon;
+        if (poly[i].lon > max_x) max_x = poly[i].lon;
+        if (poly[i].lat < min_y) min_y = poly[i].lat;
+        if (poly[i].lat > max_y) max_y = poly[i].lat;
+    }
+
+    uint32_t inside_poly = 0, inside_water = 0;
+    for (int gx = 1; gx <= 7; gx++) {
+        for (int gy = 1; gy <= 7; gy++) {
+            double tx = min_x + (max_x - min_x) * (gx / 8.0);
+            double ty = min_y + (max_y - min_y) * (gy / 8.0);
+            if (IsPointInPolygon(tx, ty, poly, count)) {
+                inside_poly++;
+                if (IsPointInWaterPolys(tx, ty, water_polys, water_poly_cnt)) {
+                    inside_water++;
+                }
+            }
+        }
+    }
+
+    if (inside_poly == 0) {
+        double cx = (poly[0].lon + poly[count / 3].lon + poly[(2 * count) / 3].lon) / 3.0;
+        double cy = (poly[0].lat + poly[count / 3].lat + poly[(2 * count) / 3].lat) / 3.0;
+        return IsPointInWaterPolys(cx, cy, water_polys, water_poly_cnt);
+    }
+
+    return (inside_water * 2 >= inside_poly);
 }
 
 // --- Bowtie Intersection Detection & Geometry Helpers ---
@@ -174,6 +222,14 @@ static double CalculateSignedArea(WayNode* nodes, uint32_t count) {
     return area;
 }
 
+static void ReverseWayNodes(WayNode* nodes, uint32_t count) {
+    for (uint32_t k = 0; k < count / 2; k++) {
+        WayNode tmp = nodes[k];
+        nodes[k] = nodes[count - 1 - k];
+        nodes[count - 1 - k] = tmp;
+    }
+}
+
 static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint32_t water_poly_cnt, WayNode* road_samples, uint32_t road_sample_cnt) {
     if (coast->count < 2 || water_poly_cnt == 0) return false;
 
@@ -219,8 +275,8 @@ static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint
             t_s = (t_s < 0.0) ? 0.0 : ((t_s > 1.0) ? 1.0 : t_s);
             t_e = (t_e < 0.0) ? 0.0 : ((t_e > 1.0) ? 1.0 : t_e);
 
-            WayNode proj_s = {0, A.lat + t_s * (B.lat - A.lat), A.lon + t_s * (B.lon - A.lon)};
-            WayNode proj_e = {0, A.lat + t_e * (B.lat - A.lat), A.lon + t_e * (B.lon - A.lon)};
+            WayNode proj_s = {1, A.lat + t_s * (B.lat - A.lat), A.lon + t_s * (B.lon - A.lon)};
+            WayNode proj_e = {1, A.lat + t_e * (B.lat - A.lat), A.lon + t_e * (B.lon - A.lon)};
 
             double sd = (proj_s.lon - start_pt.lon) * (proj_s.lon - start_pt.lon) + (proj_s.lat - start_pt.lat) * (proj_s.lat - start_pt.lat);
             if (sd < cur_start_dist) {
@@ -255,6 +311,7 @@ static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint
         uint32_t idx = (seg_start + 1) % p_count;
         for (uint32_t k = 1; k <= fwd_steps; k++) {
             fwd_route[k] = water_polys[i].nodes[idx];
+            fwd_route[k].id = 1;
             idx = (idx + 1) % p_count;
         }
         fwd_route[fwd_len - 1] = cur_start_proj;
@@ -264,6 +321,7 @@ static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint
         idx = seg_start;
         for (uint32_t k = 1; k <= rev_steps; k++) {
             rev_route[k] = water_polys[i].nodes[idx];
+            rev_route[k].id = 1;
             idx = (idx == 0) ? (p_count - 1) : (idx - 1);
         }
         rev_route[rev_len - 1] = cur_start_proj;
@@ -280,8 +338,12 @@ static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint
             memcpy(poly + coast->count, candidates[c], cand_lens[c] * sizeof(WayNode));
 
             uint32_t roads = CountRoadSamplesInside(poly, p_cnt, road_samples, road_sample_cnt);
+            bool is_water = IsPolygonMostlyWater(poly, p_cnt, water_polys, water_poly_cnt);
             double area = CalculateSignedArea(poly, p_cnt);
             free(poly);
+
+            // Reject any stitched polygon that encloses water or has no roads
+            if (is_water || (road_sample_cnt > 0 && roads == 0)) continue;
 
             int score = (int)(roads * 10) + ((area < 0.0) ? 5 : 0) - (int)((cur_start_dist + cur_end_dist) * 100.0);
             if (score > best_score) {
@@ -304,7 +366,9 @@ static bool StitchWithWaterBoundary(AccumWay* coast, AccumWay* water_polys, uint
             for (uint32_t k = 0; k < best_len_overall; k++) {
                 coast->nodes[coast->count++] = best_route_overall[k];
             }
-            coast->nodes[coast->count++] = coast->nodes[0];
+            WayNode close_pt = coast->nodes[0];
+            close_pt.id = 1;
+            coast->nodes[coast->count++] = close_pt;
             free(best_route_overall);
             return true;
         }
@@ -342,6 +406,26 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
 
     if (StitchWithWaterBoundary(coast, water_polys, water_poly_cnt, road_samples, road_sample_cnt)) {
         return true;
+    }
+
+    // For unmerged open fragments, test if closing directly encloses land or water.
+    // If closing directly encloses water (e.g. a bay like Chignecto Bay) or zero roads, discard it!
+    if (coast->count < 64 || gap2 < 0.15 * 0.15) {
+        uint32_t roads = CountRoadSamplesInside(coast->nodes, coast->count, road_samples, road_sample_cnt);
+        bool is_water = IsPolygonMostlyWater(coast->nodes, coast->count, water_polys, water_poly_cnt);
+        if (is_water || (road_sample_cnt > 0 && roads == 0)) {
+            coast->merged = true;
+            return false;
+        }
+        WayNode* safe = realloc(coast->nodes, (coast->count + 1) * sizeof(WayNode));
+        if (safe) {
+            coast->nodes = safe;
+            WayNode close_pt = start_pt;
+            close_pt.id = 1;
+            coast->nodes[coast->count++] = close_pt;
+            return true;
+        }
+        return false;
     }
 
     WayNode direct_rt[2] = { end_pt, start_pt };
@@ -395,8 +479,11 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
         memcpy(poly + coast->count, cand_pts[c], cand_lens[c] * sizeof(WayNode));
 
         uint32_t roads = CountRoadSamplesInside(poly, p_cnt, road_samples, road_sample_cnt);
-        double area = CalculateSignedArea(poly, p_cnt);
+        bool is_water = IsPolygonMostlyWater(poly, p_cnt, water_polys, water_poly_cnt);
+        double area = fabs(CalculateSignedArea(poly, p_cnt));
         free(poly);
+
+        if (is_water) continue;
 
         if (best_idx == -1 || roads > best_roads || (roads == best_roads && area < best_area)) {
             best_idx = c;
@@ -405,8 +492,9 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
         }
     }
 
-    if (best_idx == -1) {
-        best_idx = (f_ok) ? 0 : ((r_ok) ? 1 : 2);
+    if (best_idx == -1 || (road_sample_cnt > 0 && best_roads == 0)) {
+        coast->merged = true;
+        return false;
     }
 
     WayNode* chosen = cand_pts[best_idx];
@@ -416,9 +504,13 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
     if (safe) {
         coast->nodes = safe;
         for (uint32_t k = 0; k < chosen_len; k++) {
-            coast->nodes[coast->count++] = chosen[k];
+            WayNode cn = chosen[k];
+            cn.id = 1;
+            coast->nodes[coast->count++] = cn;
         }
-        coast->nodes[coast->count++] = coast->nodes[0];
+        WayNode close_pt = coast->nodes[0];
+        close_pt.id = 1;
+        coast->nodes[coast->count++] = close_pt;
         return true;
     }
     return false;
@@ -515,6 +607,7 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
     }
 
+    // Bridge clipped river estuaries (up to 0.15 deg) as long as the bridge midpoint doesn't cut across open ocean
     bool bridged = true;
     while (bridged) {
         bridged = false;
@@ -524,7 +617,7 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             if ((iS.lon - iE.lon) * (iS.lon - iE.lon) + (iS.lat - iE.lat) * (iS.lat - iE.lat) < 1e-8) continue;
 
             uint32_t best_j = (uint32_t)-1;
-            double best_d = 0.08 * 0.08;
+            double best_d = 0.15 * 0.15;
 
             for (uint32_t j = 0; j < coast_cnt; j++) {
                 if (i == j || coasts[j].merged || coasts[j].count < 2) continue;
@@ -566,6 +659,86 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
                 }
             }
         }
+    }
+
+    // Chain major open coastlines around the BBox perimeter into a single landmass polygon
+    uint32_t major_idx[256];
+    uint32_t major_cnt = 0;
+    double W = max_x - min_x, H = max_y - min_y, perimeter = 2.0 * W + 2.0 * H;
+    WayNode corners[4] = { {1, max_y, max_x}, {1, max_y, min_x}, {1, min_y, min_x}, {1, min_y, max_x} };
+    double corners_p[4] = { 0.0, W, W + H, 2.0 * W + H };
+
+    for (uint32_t i = 0; i < coast_cnt && major_cnt < 256; i++) {
+        if (coasts[i].merged || coasts[i].count < 64) continue;
+        WayNode s = coasts[i].nodes[0], e = coasts[i].nodes[coasts[i].count - 1];
+        double gap2 = (s.lon - e.lon) * (s.lon - e.lon) + (s.lat - e.lat) * (s.lat - e.lat);
+        if (gap2 >= 0.15 * 0.15) {
+            major_idx[major_cnt++] = i;
+        }
+    }
+
+    if (major_cnt >= 2) {
+        for (uint32_t a = 0; a < major_cnt; a++) {
+            for (uint32_t b = a + 1; b < major_cnt; b++) {
+                WayNode pSa, pSb;
+                ProjectToBBox(coasts[major_idx[a]].nodes[0].lon, coasts[major_idx[a]].nodes[0].lat, min_x, max_x, min_y, max_y, &pSa);
+                ProjectToBBox(coasts[major_idx[b]].nodes[0].lon, coasts[major_idx[b]].nodes[0].lat, min_x, max_x, min_y, max_y, &pSb);
+                double posA = BBoxPerimeterDist(pSa, min_x, max_x, min_y, max_y);
+                double posB = BBoxPerimeterDist(pSb, min_x, max_x, min_y, max_y);
+                if (posA > posB) {
+                    uint32_t tmp = major_idx[a];
+                    major_idx[a] = major_idx[b];
+                    major_idx[b] = tmp;
+                }
+            }
+        }
+
+        uint32_t total_alloc = 0;
+        for (uint32_t m = 0; m < major_cnt; m++) total_alloc += coasts[major_idx[m]].count + 16;
+        WayNode* merged_nodes = malloc(total_alloc * sizeof(WayNode));
+        uint32_t merged_cnt = 0;
+
+        for (uint32_t m = 0; m < major_cnt; m++) {
+            AccumWay* cur = &coasts[major_idx[m]];
+            AccumWay* nxt = &coasts[major_idx[(m + 1) % major_cnt]];
+
+            memcpy(merged_nodes + merged_cnt, cur->nodes, cur->count * sizeof(WayNode));
+            merged_cnt += cur->count;
+
+            WayNode pE, pS_next;
+            ProjectToBBox(cur->nodes[cur->count - 1].lon, cur->nodes[cur->count - 1].lat, min_x, max_x, min_y, max_y, &pE);
+            ProjectToBBox(nxt->nodes[0].lon, nxt->nodes[0].lat, min_x, max_x, min_y, max_y, &pS_next);
+            pE.id = 1;
+            pS_next.id = 1;
+
+            double posE = BBoxPerimeterDist(pE, min_x, max_x, min_y, max_y);
+            double posS_next = BBoxPerimeterDist(pS_next, min_x, max_x, min_y, max_y);
+
+            merged_nodes[merged_cnt++] = pE;
+            double end_pos_fwd = (posS_next <= posE) ? posS_next + perimeter : posS_next;
+            for (int c = 0; c < 8; c++) {
+                double cp = corners_p[c % 4] + (c >= 4 ? perimeter : 0.0);
+                if (cp > posE && cp < end_pos_fwd) {
+                    merged_nodes[merged_cnt++] = corners[c % 4];
+                }
+            }
+            merged_nodes[merged_cnt++] = pS_next;
+
+            if (m > 0) {
+                cur->merged = true;
+                if (cur->name) { free(cur->name); cur->name = NULL; }
+                if (cur->pcode) { free(cur->pcode); cur->pcode = NULL; }
+                free(cur->nodes); cur->nodes = NULL;
+            }
+        }
+
+        WayNode first_pt = merged_nodes[0];
+        first_pt.id = 1;
+        merged_nodes[merged_cnt++] = first_pt;
+
+        free(coasts[major_idx[0]].nodes);
+        coasts[major_idx[0]].nodes = merged_nodes;
+        coasts[major_idx[0]].count = merged_cnt;
     }
 
     for (uint32_t i = 0; i < coast_cnt; i++) {
@@ -870,10 +1043,16 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         fread(wnodes, sizeof(WayNode), ref_count, f_raw);
 
                         if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
-                            for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 5) {
+                            for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 50) {
                                 if (road_sample_cnt >= road_sample_cap) {
-                                    road_sample_cap *= 2;
-                                    road_samples = realloc(road_samples, road_sample_cap * sizeof(WayNode));
+                                    uint32_t new_cap = road_sample_cap * 2;
+                                    WayNode* safe = realloc(road_samples, new_cap * sizeof(WayNode));
+                                    if (!safe) {
+                                        SetStatus("Error: Out of memory allocating road samples.");
+                                        break;
+                                    }
+                                    road_samples = safe;
+                                    road_sample_cap = new_cap;
                                 }
                                 road_samples[road_sample_cnt++] = wnodes[s_idx];
                             }
@@ -931,14 +1110,8 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     double dy = tmp_nodes[0].lat - tmp_nodes[cnt-1].lat;
                     bool is_closed = (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
 
-                    if (is_closed || fc != CLASS_COASTLINE) {
-                        if (!is_closed && cnt + 1 <= r_cap) {
-                            tmp_nodes[cnt] = tmp_nodes[0];
-                            cnt++;
-                        } else if (is_closed) {
-                            tmp_nodes[cnt-1] = tmp_nodes[0];
-                        }
-                        uint8_t out_fc = (fc == CLASS_COASTLINE) ? CLASS_LAND : fc;
+                    if (is_closed) {
+                        tmp_nodes[cnt-1] = tmp_nodes[0];
                         double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
                         for (uint32_t j = 0; j < cnt; j++) {
                             if (tmp_nodes[j].lon < min_lon) min_lon = tmp_nodes[j].lon; if (tmp_nodes[j].lon > max_lon) max_lon = tmp_nodes[j].lon;
@@ -948,7 +1121,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                         if (!g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
                         if (in_bbox) {
-                            WriteRawFeature(f_raw, tmp_nodes, cnt, true, nlen ? name_buf : NULL, plen ? pcode_buf : NULL, out_fc, &sort_entries, &written_feats, &feature_capacity);
+                            WriteRawFeature(f_raw, tmp_nodes, cnt, true, nlen ? name_buf : NULL, plen ? pcode_buf : NULL, fc, &sort_entries, &written_feats, &feature_capacity);
                         }
                     } else {
                         if (open_cnt >= coast_cap) {
@@ -1153,28 +1326,28 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
 
                     if (valid && ref_count >= 2) {
                         if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
-                            for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 5) {
+                            for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 50) {
                                 if (road_sample_cnt >= road_sample_cap) {
-                                    road_sample_cap *= 2;
-                                    road_samples = realloc(road_samples, road_sample_cap * sizeof(WayNode));
+                                    uint32_t new_cap = road_sample_cap * 2;
+                                    WayNode* safe = realloc(road_samples, new_cap * sizeof(WayNode));
+                                    if (!safe) {
+                                        SetStatus("Error: Out of memory allocating road samples.");
+                                        break;
+                                    }
+                                    road_samples = safe;
+                                    road_sample_cap = new_cap;
                                 }
                                 road_samples[road_sample_cnt++] = wnodes[s_idx];
                             }
                         }
 
-                        if (fc == CLASS_COASTLINE || fc == CLASS_WATER || fc == CLASS_PARK || fc == CLASS_LAND) {
+                        if (fc == CLASS_COASTLINE) {
                             double dx = wnodes[0].lon - wnodes[ref_count-1].lon;
                             double dy = wnodes[0].lat - wnodes[ref_count-1].lat;
-                            bool is_closed = (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
+                            bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
 
-                            if (is_closed || fc != CLASS_COASTLINE) {
-                                if (!is_closed) {
-                                    WayNode* safe = realloc(wnodes, (ref_count + 1) * sizeof(WayNode));
-                                    if (safe) { wnodes = safe; wnodes[ref_count] = wnodes[0]; ref_count++; }
-                                } else {
-                                    wnodes[ref_count-1] = wnodes[0];
-                                }
-                                uint8_t out_fc = (fc == CLASS_COASTLINE) ? CLASS_LAND : fc;
+                            if (is_closed) {
+                                wnodes[ref_count-1] = wnodes[0];
                                 double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
                                 for (uint32_t i = 0; i < ref_count; i++) {
                                     if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon; if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
@@ -1183,7 +1356,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                 bool in_bbox = true;
                                 if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                                 if (!g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-                                if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, out_fc, &sort_entries, &written_feats, &feature_capacity);
+                                if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, CLASS_LAND, &sort_entries, &written_feats, &feature_capacity);
                                 if (name) free(name); if (pcode) free(pcode); free(wnodes);
                             } else {
                                 if (coast_cnt >= coast_cap) {
@@ -1192,6 +1365,25 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                 }
                                 coasts[coast_cnt].name = name; coasts[coast_cnt].pcode = pcode; coasts[coast_cnt].count = ref_count; coasts[coast_cnt].nodes = wnodes; coasts[coast_cnt].merged = false; coasts[coast_cnt].fc = fc; coast_cnt++;
                             }
+                        } else if (fc == CLASS_WATER || fc == CLASS_PARK || fc == CLASS_LAND) {
+                            double dx = wnodes[0].lon - wnodes[ref_count-1].lon;
+                            double dy = wnodes[0].lat - wnodes[ref_count-1].lat;
+                            bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
+                            if (is_closed) wnodes[ref_count-1] = wnodes[0];
+
+                            double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
+                            for (uint32_t i = 0; i < ref_count; i++) {
+                                if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon; if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
+                                if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat; if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
+                            }
+                            bool in_bbox = true;
+                            if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
+                            if (is_closed && !g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
+
+                            if (in_bbox) {
+                                WriteRawFeature(f_raw, wnodes, ref_count, is_closed, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
+                            }
+                            if (name) free(name); if (pcode) free(pcode); free(wnodes);
                         } else {
                             double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
                             for (uint32_t i = 0; i < ref_count; i++) {
