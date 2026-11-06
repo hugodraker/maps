@@ -1,10 +1,10 @@
 /* ============================================================================
  *
- * pbf2qjm - High-Speed Out-Of-Core PBF to QJMC Compiler
+ * pbf2qjm - High-Speed Out-Of-Core PBF to QJMC Compiler (32-bit LargeAddressAware)
  *
  * COMPILATION:
  *
- * gcc -O3 -m32 -mwindows -Wall -Wextra pbf2qjm.c -o pbf2qjm.exe -lcomdlg32 -lgdi32 -lshell32
+ * gcc -O3 -m32 -mwindows -Wl,--large-address-aware -Wall -Wextra pbf2qjm.c -o pbf2qjm.exe -lcomdlg32 -lgdi32 -lshell32
  *
  *  2026 HUGO
  *
@@ -30,6 +30,10 @@ typedef struct {
     uint32_t count;
 } RefPoly;
 
+// --- EXPLICIT STRUCT ADDITIONS FOR EXTERNAL SORTING ---
+//typedef struct { uint64_t morton; uint64_t offset; } SortEntry;
+typedef struct { SortEntry entry; int chunk_idx; } HeapNode;
+
 static RefPoly* g_RefPolys = NULL;
 static uint32_t g_RefPolyCount = 0;
 
@@ -48,6 +52,7 @@ static int g_SimpNoRoads = 100;
 
 // Forward declaration to satisfy the compiler
 static LRESULT CALLBACK CompilerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bool is_area, const char* name, const char* pcode, uint8_t fc, FILE* f_sort, uint64_t* cnt);
 
 static void ProjectToBBox(double lon, double lat, double min_x, double max_x, double min_y, double max_y, WayNode* out_node);
 static bool IsPointInPolygon(double lon, double lat, WayNode* poly, uint32_t count) {
@@ -408,8 +413,6 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
         return true;
     }
 
-    // For unmerged open fragments, test if closing directly encloses land or water.
-    // If closing directly encloses water (e.g. a bay like Chignecto Bay) or zero roads, discard it!
     if (coast->count < 64 || gap2 < 0.15 * 0.15) {
         uint32_t roads = CountRoadSamplesInside(coast->nodes, coast->count, road_samples, road_sample_cnt);
         bool is_water = IsPolygonMostlyWater(coast->nodes, coast->count, water_polys, water_poly_cnt);
@@ -427,9 +430,6 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
         }
         return false;
     }
-
-    WayNode direct_rt[2] = { end_pt, start_pt };
-    bool direct_ok = !HasBowtie(coast->nodes, coast->count, direct_rt, 2);
 
     WayNode pS, pE;
     ProjectToBBox(start_pt.lon, start_pt.lat, min_x, max_x, min_y, max_y, &pS);
@@ -451,60 +451,11 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
     }
     f_rt[f_cnt++] = pS;
 
-    WayNode r_rt[12]; uint32_t r_cnt = 0;
-    r_rt[r_cnt++] = pE;
-    double end_pos_rev = (posS >= posE) ? posS - perimeter : posS;
-    for (int c = 7; c >= 0; c--) {
-        double cp = corners_p[c % 4] + (c >= 4 ? perimeter : 0.0) - perimeter;
-        if (cp < posE && cp > end_pos_rev) r_rt[r_cnt++] = corners[c % 4];
-    }
-    r_rt[r_cnt++] = pS;
-
-    bool f_ok = !HasBowtie(coast->nodes, coast->count, f_rt, f_cnt);
-    bool r_ok = !HasBowtie(coast->nodes, coast->count, r_rt, r_cnt);
-
-    WayNode* cand_pts[3] = { f_rt, r_rt, direct_rt };
-    uint32_t cand_lens[3] = { f_cnt, r_cnt, 2 };
-    bool cand_valid[3] = { f_ok, r_ok, direct_ok };
-
-    int best_idx = -1;
-    uint32_t best_roads = 0;
-    double best_area = 1e30;
-
-    for (int c = 0; c < 3; c++) {
-        if (!cand_valid[c]) continue;
-        uint32_t p_cnt = coast->count + cand_lens[c];
-        WayNode* poly = malloc(p_cnt * sizeof(WayNode));
-        memcpy(poly, coast->nodes, coast->count * sizeof(WayNode));
-        memcpy(poly + coast->count, cand_pts[c], cand_lens[c] * sizeof(WayNode));
-
-        uint32_t roads = CountRoadSamplesInside(poly, p_cnt, road_samples, road_sample_cnt);
-        bool is_water = IsPolygonMostlyWater(poly, p_cnt, water_polys, water_poly_cnt);
-        double area = fabs(CalculateSignedArea(poly, p_cnt));
-        free(poly);
-
-        if (is_water) continue;
-
-        if (best_idx == -1 || roads > best_roads || (roads == best_roads && area < best_area)) {
-            best_idx = c;
-            best_roads = roads;
-            best_area = area;
-        }
-    }
-
-    if (best_idx == -1 || (road_sample_cnt > 0 && best_roads == 0)) {
-        coast->merged = true;
-        return false;
-    }
-
-    WayNode* chosen = cand_pts[best_idx];
-    uint32_t chosen_len = cand_lens[best_idx];
-
-    WayNode* safe = realloc(coast->nodes, (coast->count + chosen_len + 1) * sizeof(WayNode));
+    WayNode* safe = realloc(coast->nodes, (coast->count + f_cnt + 1) * sizeof(WayNode));
     if (safe) {
         coast->nodes = safe;
-        for (uint32_t k = 0; k < chosen_len; k++) {
-            WayNode cn = chosen[k];
+        for (uint32_t k = 0; k < f_cnt; k++) {
+            WayNode cn = f_rt[k];
             cn.id = 1;
             coast->nodes[coast->count++] = cn;
         }
@@ -515,7 +466,6 @@ static bool CloseSingleCoastlineNoBowtie(AccumWay* coast, AccumWay* water_polys,
     }
     return false;
 }
-
 static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_cnt, AccumWay* water_polys, uint32_t water_poly_cnt, WayNode* road_samples, uint32_t road_sample_cnt, double min_x, double max_x, double min_y, double max_y) {
     for (uint32_t seed_step = 0; seed_step < coast_cnt; seed_step++) {
         uint32_t i = (seed_step % 2 == 0)
@@ -607,7 +557,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
     }
 
-    // Bridge clipped river estuaries (up to 0.15 deg) as long as the bridge midpoint doesn't cut across open ocean
     bool bridged = true;
     while (bridged) {
         bridged = false;
@@ -661,7 +610,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
     }
 
-    // Chain major open coastlines around the BBox perimeter into a single landmass polygon
     uint32_t major_idx[256];
     uint32_t major_cnt = 0;
     double W = max_x - min_x, H = max_y - min_y, perimeter = 2.0 * W + 2.0 * H;
@@ -746,6 +694,7 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         CloseSingleCoastlineNoBowtie(&coasts[i], water_polys, water_poly_cnt, road_samples, road_sample_cnt, min_x, max_x, min_y, max_y);
     }
 }
+
 static void LoadConfig() {
     GetPrivateProfileStringA("MapData", "CoastlineShapefile", "", g_ShapefileFile, MAX_PATH, ".\\pbf2qjm.ini");
 }
@@ -807,10 +756,11 @@ static void DeleteTempFilesForOutput(const char* out_filename) {
     if (!out_filename || !*out_filename) return;
     const char* suffixes[] = {
         ".ways.A.tmp", ".ways.B.tmp", ".ways.resolved.tmp",
-        ".nodes.tmp", ".raw.tmp", ".coasts.tmp"
+        ".nodes.tmp", ".raw.tmp", ".coasts.tmp",
+        ".sort.tmp", ".sorted.tmp" // Added sort temp files
     };
     int removed_cnt = 0;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         char tmp_path[1024];
         snprintf(tmp_path, sizeof(tmp_path), "%s%s", out_filename, suffixes[i]);
         if (remove(tmp_path) == 0) removed_cnt++;
@@ -889,8 +839,68 @@ static void LoadReferenceMap(const char* qjm_path) {
     SetStatus("Loaded %u reference polygons for stitching.", g_RefPolyCount);
 }
 
-static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bool is_area, const char* name, const char* pcode, uint8_t fc, SortEntry** entries, uint64_t* cnt, uint32_t* cap) {
-    if (!f_raw || !wnodes || ref_count == 0) return;
+// --- NEW EXTERNAL MERGE SORT FUNCTIONS FOR PASS 5 ---
+void Heapify(HeapNode* heap, int size, int i) {
+    int smallest = i;
+    int left = 2 * i + 1, right = 2 * i + 2;
+    if (left < size && heap[left].entry.morton < heap[smallest].entry.morton) smallest = left;
+    if (right < size && heap[right].entry.morton < heap[smallest].entry.morton) smallest = right;
+    if (smallest != i) {
+        HeapNode temp = heap[i]; heap[i] = heap[smallest]; heap[smallest] = temp;
+        Heapify(heap, size, smallest);
+    }
+}
+
+bool ExternalMergeSort(const char* sort_tmp_name, const char* sorted_tmp_name) {
+    FILE* f_in = fopen(sort_tmp_name, "rb"); if (!f_in) return false;
+    uint32_t chunk_size = 5000000; 
+    SortEntry* chunk = malloc(chunk_size * sizeof(SortEntry)); if (!chunk) return false;
+    int num_chunks = 0; uint64_t read_feats; char chunk_name[1024];
+
+    SetStatus("Pass 5: Splitting into sorted chunks on disk...");
+    while ((read_feats = fread(chunk, sizeof(SortEntry), chunk_size, f_in)) > 0) {
+        qsort(chunk, read_feats, sizeof(SortEntry), CompareSortEntry);
+        snprintf(chunk_name, sizeof(chunk_name), "%s.chunk%d", sort_tmp_name, num_chunks);
+        FILE* f_out = fopen(chunk_name, "wb"); fwrite(chunk, sizeof(SortEntry), read_feats, f_out); fclose(f_out);
+        num_chunks++;
+    }
+    free(chunk); fclose(f_in);
+
+    SetStatus("Pass 5: K-Way Merge %d chunks into final list...", num_chunks);
+    FILE** chunk_files = malloc(num_chunks * sizeof(FILE*));
+    HeapNode* heap = malloc(num_chunks * sizeof(HeapNode));
+    int heap_size = 0;
+
+    for (int i = 0; i < num_chunks; i++) {
+        snprintf(chunk_name, sizeof(chunk_name), "%s.chunk%d", sort_tmp_name, i);
+        chunk_files[i] = fopen(chunk_name, "rb");
+        if (fread(&heap[heap_size].entry, sizeof(SortEntry), 1, chunk_files[i]) == 1) {
+            heap[heap_size].chunk_idx = i; heap_size++;
+        }
+    }
+    for (int i = heap_size / 2 - 1; i >= 0; i--) Heapify(heap, heap_size, i);
+
+    FILE* f_sorted = fopen(sorted_tmp_name, "wb");
+    char* out_buf = malloc(IO_BUF_SIZE); if (f_sorted && out_buf) setvbuf(f_sorted, out_buf, _IOFBF, IO_BUF_SIZE);
+
+    while (heap_size > 0) {
+        fwrite(&heap[0].entry, sizeof(SortEntry), 1, f_sorted);
+        int c_idx = heap[0].chunk_idx;
+        if (fread(&heap[0].entry, sizeof(SortEntry), 1, chunk_files[c_idx]) == 1) Heapify(heap, heap_size, 0);
+        else { heap[0] = heap[heap_size - 1]; heap_size--; Heapify(heap, heap_size, 0); }
+    }
+    fclose(f_sorted); if (out_buf) free(out_buf);
+
+    for (int i = 0; i < num_chunks; i++) {
+        fclose(chunk_files[i]); snprintf(chunk_name, sizeof(chunk_name), "%s.chunk%d", sort_tmp_name, i); remove(chunk_name);
+    }
+    free(chunk_files); free(heap);
+    return true;
+}
+
+// --- UPDATED WriteRawFeature DIRECTLY TO DISK ---
+static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bool is_area, const char* name, const char* pcode, uint8_t fc, FILE* f_sort, uint64_t* cnt) {
+    if (!f_raw || !f_sort || !wnodes || ref_count == 0) return;
 
     uint16_t nlen = name ? (uint16_t)strlen(name) : 0;
     uint16_t plen = pcode ? (uint16_t)strlen(pcode) : 0;
@@ -923,12 +933,10 @@ static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bo
     int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF);
     int32_t c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
 
-    if (*cnt >= *cap) {
-        *cap = (*cap == 0) ? 250000 : (*cap * 2);
-        *entries = realloc(*entries, *cap * sizeof(SortEntry));
-    }
-    (*entries)[*cnt].morton = EncodeMorton(c_ix, c_iy);
-    (*entries)[*cnt].offset = offset;
+    SortEntry entry;
+    entry.morton = EncodeMorton(c_ix, c_iy);
+    entry.offset = offset;
+    fwrite(&entry, sizeof(SortEntry), 1, f_sort);
     (*cnt)++;
 }
 
@@ -958,7 +966,70 @@ static uint32_t DecimateNodes(WayNode* in_nodes, uint32_t in_cnt, WayNode* out_n
 }
 
 #include "pbfs.h"
-#include "shps.h"
+// --- UPDATED ProcessShapefile USING FILE* f_sort ---
+static void ProcessShapefile(const char* shp_path, FILE* f_raw, FILE* f_sort, uint64_t* cnt, bool has_bbox, double b_minLon, double b_minLat, double b_maxLon, double b_maxLat) {
+    FILE* f = fopen(shp_path, "rb");
+    if (!f) return;
+    
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 100, SEEK_SET);
+
+    while (ftell(f) < file_size) {
+        uint32_t rec_num, rec_len;
+        if (fread(&rec_num, 4, 1, f) != 1) break;
+        if (fread(&rec_len, 4, 1, f) != 1) break;
+        rec_len = SwapEndian32(rec_len) * 2; 
+        
+        long next_rec = ftell(f) + rec_len;
+        uint32_t shape_type;
+        if (fread(&shape_type, 4, 1, f) != 1) break; 
+        
+        if (shape_type == 3 || shape_type == 5) { 
+            double box[4];
+            if (fread(box, sizeof(double), 4, f) != 4) break; 
+            
+            uint32_t num_parts, num_points;
+            if (fread(&num_parts, 4, 1, f) != 1) break;
+            if (fread(&num_points, 4, 1, f) != 1) break;
+            
+            uint32_t* parts = malloc(num_parts * 4);
+            fread(parts, 4, num_parts, f);
+            
+            WayNode* all_points = malloc(num_points * sizeof(WayNode));
+            for (uint32_t i = 0; i < num_points; i++) {
+                double pt[2];
+                fread(pt, sizeof(double), 2, f);
+                all_points[i].lon = pt[0];
+                all_points[i].lat = pt[1];
+                all_points[i].id = 0xFFFFFFFFFFFFFFFFULL;
+            }
+            
+            for (uint32_t i = 0; i < num_parts; i++) {
+                uint32_t start = parts[i];
+                uint32_t end = (i == num_parts - 1) ? num_points : parts[i + 1];
+                uint32_t ref_count = end - start;
+                if (ref_count >= 2) {
+                    WayNode* wnodes = malloc(ref_count * sizeof(WayNode));
+                    for (uint32_t j = 0; j < ref_count; j++) wnodes[j] = all_points[start + j];
+                    
+                    bool in_bbox = true;
+                    if (has_bbox && (box[2] < b_minLon || box[0] > b_maxLon || box[3] < b_minLat || box[1] > b_maxLat)) in_bbox = false;
+                    
+                    if (in_bbox) {
+                        WriteRawFeature(f_raw, wnodes, ref_count, (shape_type == 5), "Coastline", NULL, CLASS_COASTLINE, f_sort, cnt);
+                    }
+                    free(wnodes);
+                }
+            }
+            free(parts);
+            free(all_points);
+        }
+        fseek(f, next_rec, SEEK_SET); 
+    }
+    fclose(f);
+}
+
 static int RunCompilation(const char* in_filename, const char* out_filename, const char* ref_filename, bool has_bbox, double b_minLon, double b_minLat, double b_maxLon, double b_maxLat) {
     (void)ref_filename;
 
@@ -968,11 +1039,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
     char nodes_tmp_name[1024]; snprintf(nodes_tmp_name, sizeof(nodes_tmp_name), "%s.nodes.tmp", out_filename);
     char raw_tmp_name[1024]; snprintf(raw_tmp_name, sizeof(raw_tmp_name), "%s.raw.tmp", out_filename);
     char coasts_tmp_name[1024]; snprintf(coasts_tmp_name, sizeof(coasts_tmp_name), "%s.coasts.tmp", out_filename);
+    char sort_tmp_name[1024]; snprintf(sort_tmp_name, sizeof(sort_tmp_name), "%s.sort.tmp", out_filename);
+    char sorted_tmp_name[1024]; snprintf(sorted_tmp_name, sizeof(sorted_tmp_name), "%s.sorted.tmp", out_filename);
 
-    uint32_t feature_capacity = 250000; SortEntry* sort_entries = malloc(feature_capacity * sizeof(SortEntry));
     uint64_t written_feats = 0; FILE* f_raw = NULL; bool resumed = false; bool is_main_input_shp = false;
     const char* ext_in = strrchr(in_filename, '.'); if (ext_in && strcasecmp(ext_in, ".shp") == 0) is_main_input_shp = true;
-
     uint32_t EOF_MARKER = 0xDEADBEEF;
 
     f_raw = fopen(raw_tmp_name, "rb");
@@ -984,6 +1055,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
             if (marker == EOF_MARKER) {
                 SetStatus("Resuming from completed %s (Pass 5)...", raw_tmp_name);
                 FSEEK64(f_raw, 0, SEEK_SET);
+                FILE* f_sort = fopen(sort_tmp_name, "wb");
                 uint32_t r_cap = 65536; WayNode* wnodes = malloc(r_cap * sizeof(WayNode));
                 while (FTELL64(f_raw) < raw_sz - 4) {
                     uint64_t offset = FTELL64(f_raw); uint32_t total_len;
@@ -1005,11 +1077,10 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     
                     double cx = (min_lon + max_lon) / 2.0, cy = (min_lat + max_lat) / 2.0;
                     int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF), c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
-                    if (written_feats >= feature_capacity) { feature_capacity *= 2; sort_entries = realloc(sort_entries, feature_capacity * sizeof(SortEntry)); }
-                    sort_entries[written_feats].morton = EncodeMorton(c_ix, c_iy); sort_entries[written_feats].offset = offset; written_feats++;
+                    SortEntry entry; entry.morton = EncodeMorton(c_ix, c_iy); entry.offset = offset;
+                    fwrite(&entry, sizeof(SortEntry), 1, f_sort); written_feats++;
                 }
-                free(wnodes);
-                resumed = true;
+                free(wnodes); fclose(f_sort); resumed = true;
             }
         }
         if (!resumed) { fclose(f_raw); f_raw = NULL; }
@@ -1017,9 +1088,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
 
     bool resume_coasts = false;
     uint32_t coast_cap = 0, coast_cnt = 0; AccumWay* coasts = NULL;
-    uint32_t road_sample_cap = 500000;
-    uint32_t road_sample_cnt = 0;
-    WayNode* road_samples = malloc(road_sample_cap * sizeof(WayNode));
+    uint32_t road_sample_cap = 500000; uint32_t road_sample_cnt = 0; WayNode* road_samples = malloc(road_sample_cap * sizeof(WayNode));
 
     if (!resumed && !is_main_input_shp) {
         FILE* f_cst_in = fopen(coasts_tmp_name, "rb");
@@ -1027,9 +1096,9 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
             int64_t safe_raw_sz = 0;
             if (fread(&safe_raw_sz, 8, 1, f_cst_in) == 1 && fread(&coast_cnt, 4, 1, f_cst_in) == 1) {
                 SetStatus("Resuming Polygon Assembly from %s (%u ways)...", coasts_tmp_name, coast_cnt);
-                
                 f_raw = fopen(raw_tmp_name, "rb");
                 if (f_raw) {
+                    FILE* f_sort = fopen(sort_tmp_name, "wb");
                     uint32_t r_cap = 65536; WayNode* wnodes = malloc(r_cap * sizeof(WayNode));
                     while (FTELL64(f_raw) < safe_raw_sz) {
                         uint64_t offset = FTELL64(f_raw); uint32_t total_len;
@@ -1045,16 +1114,8 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
                             for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 50) {
                                 if (road_sample_cnt >= road_sample_cap) {
-                                    uint32_t new_cap = road_sample_cap * 2;
-                                    WayNode* safe = realloc(road_samples, new_cap * sizeof(WayNode));
-                                    if (!safe) {
-                                        SetStatus("Error: Out of memory allocating road samples.");
-                                        break;
-                                    }
-                                    road_samples = safe;
-                                    road_sample_cap = new_cap;
-                                }
-                                road_samples[road_sample_cnt++] = wnodes[s_idx];
+                                    road_sample_cap *= 2; road_samples = realloc(road_samples, road_sample_cap * sizeof(WayNode));
+                                } road_samples[road_sample_cnt++] = wnodes[s_idx];
                             }
                         }
 
@@ -1065,11 +1126,10 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         }
                         double cx = (min_lon + max_lon) / 2.0, cy = (min_lat + max_lat) / 2.0;
                         int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF), c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
-                        if (written_feats >= feature_capacity) { feature_capacity *= 2; sort_entries = realloc(sort_entries, feature_capacity * sizeof(SortEntry)); }
-                        sort_entries[written_feats].morton = EncodeMorton(c_ix, c_iy); sort_entries[written_feats].offset = offset; written_feats++;
+                        SortEntry entry; entry.morton = EncodeMorton(c_ix, c_iy); entry.offset = offset;
+                        fwrite(&entry, sizeof(SortEntry), 1, f_sort); written_feats++;
                     }
-                    free(wnodes);
-                    fclose(f_raw);
+                    free(wnodes); fclose(f_sort); fclose(f_raw);
                 }
 
                 FILE* f_old = fopen(raw_tmp_name, "rb"); FILE* f_new = fopen("temp_truncate.tmp", "wb");
@@ -1081,33 +1141,27 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (read_bytes == 0) break;
                         fwrite(buf, 1, read_bytes, f_new); remain -= read_bytes;
                     }
-                    free(buf); fclose(f_old); fclose(f_new);
-                    remove(raw_tmp_name); rename("temp_truncate.tmp", raw_tmp_name);
+                    free(buf); fclose(f_old); fclose(f_new); remove(raw_tmp_name); rename("temp_truncate.tmp", raw_tmp_name);
                 }
                 f_raw = fopen(raw_tmp_name, "ab");
+                FILE* f_sort = fopen(sort_tmp_name, "ab");
 
-                uint32_t open_cnt = 0;
-                coast_cap = 65536;
-                coasts = malloc(coast_cap * sizeof(AccumWay));
+                uint32_t open_cnt = 0; coast_cap = 65536; coasts = malloc(coast_cap * sizeof(AccumWay));
                 uint32_t r_cap = 65536; WayNode* tmp_nodes = malloc(r_cap * sizeof(WayNode));
 
                 for (uint32_t i = 0; i < coast_cnt; i++) {
-                    uint8_t nlen, plen, fc;
-                    char name_buf[256] = {0}, pcode_buf[256] = {0};
+                    uint8_t nlen, plen, fc; char name_buf[256] = {0}, pcode_buf[256] = {0};
                     if (fread(&nlen, 1, 1, f_cst_in) != 1) break;
                     if (nlen) { fread(name_buf, 1, nlen, f_cst_in); name_buf[nlen] = 0; }
                     if (fread(&plen, 1, 1, f_cst_in) != 1) break;
                     if (plen) { fread(pcode_buf, 1, plen, f_cst_in); pcode_buf[plen] = 0; }
-                    uint32_t cnt = 0;
-                    if (fread(&cnt, 4, 1, f_cst_in) != 1) break;
+                    uint32_t cnt = 0; if (fread(&cnt, 4, 1, f_cst_in) != 1) break;
                     if (cnt > r_cap) { r_cap = cnt + 16384; tmp_nodes = realloc(tmp_nodes, r_cap * sizeof(WayNode)); }
                     if (fread(tmp_nodes, sizeof(WayNode), cnt, f_cst_in) != cnt) break;
                     if (fread(&fc, 1, 1, f_cst_in) != 1) break;
 
                     if (cnt < 2) continue;
-
-                    double dx = tmp_nodes[0].lon - tmp_nodes[cnt-1].lon;
-                    double dy = tmp_nodes[0].lat - tmp_nodes[cnt-1].lat;
+                    double dx = tmp_nodes[0].lon - tmp_nodes[cnt-1].lon, dy = tmp_nodes[0].lat - tmp_nodes[cnt-1].lat;
                     bool is_closed = (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
 
                     if (is_closed) {
@@ -1117,86 +1171,49 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             if (tmp_nodes[j].lon < min_lon) min_lon = tmp_nodes[j].lon; if (tmp_nodes[j].lon > max_lon) max_lon = tmp_nodes[j].lon;
                             if (tmp_nodes[j].lat < min_lat) min_lat = tmp_nodes[j].lat; if (tmp_nodes[j].lat > max_lat) max_lat = tmp_nodes[j].lat;
                         }
-                        bool in_bbox = true;
-                        if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
+                        bool in_bbox = true; if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                         if (!g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-                        if (in_bbox) {
-                            WriteRawFeature(f_raw, tmp_nodes, cnt, true, nlen ? name_buf : NULL, plen ? pcode_buf : NULL, fc, &sort_entries, &written_feats, &feature_capacity);
-                        }
+                        if (in_bbox) WriteRawFeature(f_raw, tmp_nodes, cnt, true, nlen ? name_buf : NULL, plen ? pcode_buf : NULL, fc, f_sort, &written_feats);
                     } else {
-                        if (open_cnt >= coast_cap) {
-                            coast_cap *= 2;
-                            coasts = realloc(coasts, coast_cap * sizeof(AccumWay));
-                        }
+                        if (open_cnt >= coast_cap) { coast_cap *= 2; coasts = realloc(coasts, coast_cap * sizeof(AccumWay)); }
                         coasts[open_cnt].name = nlen ? strcpy(malloc(nlen + 1), name_buf) : NULL;
                         coasts[open_cnt].pcode = plen ? strcpy(malloc(plen + 1), pcode_buf) : NULL;
-                        coasts[open_cnt].count = cnt;
-                        coasts[open_cnt].nodes = malloc(cnt * sizeof(WayNode));
-                        for (uint32_t k = 0; k < cnt; k++) {
-                            coasts[open_cnt].nodes[k].id = 0;
-                            coasts[open_cnt].nodes[k].lat = tmp_nodes[k].lat;
-                            coasts[open_cnt].nodes[k].lon = tmp_nodes[k].lon;
-                        }
-                        coasts[open_cnt].fc = fc;
-                        coasts[open_cnt].merged = false;
-                        open_cnt++;
+                        coasts[open_cnt].count = cnt; coasts[open_cnt].nodes = malloc(cnt * sizeof(WayNode));
+                        for (uint32_t k = 0; k < cnt; k++) { coasts[open_cnt].nodes[k].id = 0; coasts[open_cnt].nodes[k].lat = tmp_nodes[k].lat; coasts[open_cnt].nodes[k].lon = tmp_nodes[k].lon; }
+                        coasts[open_cnt].fc = fc; coasts[open_cnt].merged = false; open_cnt++;
                     }
                 }
-                free(tmp_nodes);
-                fclose(f_cst_in);
-                coast_cnt = open_cnt;
-                resume_coasts = true;
-            } else {
-                fclose(f_cst_in);
-            }
+                free(tmp_nodes); fclose(f_cst_in); fclose(f_sort);
+                coast_cnt = open_cnt; resume_coasts = true;
+            } else fclose(f_cst_in);
         }
 
         if (is_main_input_shp) {
             SetStatus("Pass 1-4: Extracting ESRI Shapefile geometries...");
-            f_raw = fopen(raw_tmp_name, "wb"); if (!f_raw) { free(road_samples); return 1; }
-            ProcessShapefile(in_filename, f_raw, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
-            fwrite(&EOF_MARKER, 4, 1, f_raw);
-            fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
+            f_raw = fopen(raw_tmp_name, "wb"); FILE* f_sort = fopen(sort_tmp_name, "wb");
+            if (!f_raw || !f_sort) { free(road_samples); return 1; }
+            ProcessShapefile(in_filename, f_raw, f_sort, &written_feats, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
+            fwrite(&EOF_MARKER, 4, 1, f_raw); fclose(f_raw); fclose(f_sort); f_raw = fopen(raw_tmp_name, "rb");
         } else {
             if (!resume_coasts) {
-                char* current_ways = ways_tmp_a;
-                char* next_ways = ways_tmp_b;
-
+                char* current_ways = ways_tmp_a; char* next_ways = ways_tmp_b;
                 bool has_resolved_ways = (GetFileSize64(ways_resolved_name) > 0);
-                if (has_resolved_ways) {
-                    SetStatus("Found %s! Resuming at Pass 4...", ways_resolved_name);
-                    current_ways = ways_resolved_name;
-                } else {
-                    bool has_ways_a = (GetFileSize64(ways_tmp_a) > 0);
-                    bool has_ways_b = (GetFileSize64(ways_tmp_b) > 0);
-                    bool has_nodes  = (GetFileSize64(nodes_tmp_name) > 0);
-
-                    if (!has_ways_a && has_ways_b) {
-                        current_ways = ways_tmp_b;
-                        next_ways = ways_tmp_a;
-                        has_ways_a = true;
-                    }
+                if (has_resolved_ways) { SetStatus("Found %s! Resuming at Pass 4...", ways_resolved_name); current_ways = ways_resolved_name; }
+                else {
+                    bool has_ways_a = (GetFileSize64(ways_tmp_a) > 0), has_ways_b = (GetFileSize64(ways_tmp_b) > 0), has_nodes = (GetFileSize64(nodes_tmp_name) > 0);
+                    if (!has_ways_a && has_ways_b) { current_ways = ways_tmp_b; next_ways = ways_tmp_a; has_ways_a = true; }
 
                     for (int extract_mode = 1; extract_mode <= 2; extract_mode++) {
-                        if (extract_mode == 1 && has_ways_a) {
-                            SetStatus("Pass 1: Reusing existing ways temp file...");
-                            continue;
-                        }
-                        if (extract_mode == 2 && has_nodes) {
-                            SetStatus("Pass 2: Reusing existing nodes temp file...");
-                            continue;
-                        }
+                        if (extract_mode == 1 && has_ways_a) { SetStatus("Pass 1: Reusing existing ways temp file..."); continue; }
+                        if (extract_mode == 2 && has_nodes) { SetStatus("Pass 2: Reusing existing nodes temp file..."); continue; }
 
                         FILE* tmpOut = NULL; char* io_buf = malloc(IO_BUF_SIZE);
                         if (extract_mode == 1) { SetStatus("Pass 1: Streaming Filtered Ways to Disk..."); tmpOut = fopen(current_ways, "wb"); }
                         else { SetStatus("Pass 2: Streaming All Nodes to Disk..."); tmpOut = fopen(nodes_tmp_name, "wb"); }
                         if (tmpOut && io_buf) setvbuf(tmpOut, io_buf, _IOFBF, IO_BUF_SIZE);
 
-                        FILE* file = fopen(in_filename, "rb");
-                        if (!file) { if (tmpOut) fclose(tmpOut); if (io_buf) free(io_buf); free(road_samples); return 1; }
-
-                        char* read_buf = malloc(IO_BUF_SIZE);
-                        if (read_buf) setvbuf(file, read_buf, _IOFBF, IO_BUF_SIZE);
+                        FILE* file = fopen(in_filename, "rb"); if (!file) { if (tmpOut) fclose(tmpOut); if (io_buf) free(io_buf); free(road_samples); return 1; }
+                        char* read_buf = malloc(IO_BUF_SIZE); if (read_buf) setvbuf(file, read_buf, _IOFBF, IO_BUF_SIZE);
                         
                         while (!feof(file)) {
                             uint32_t header_len_be = 0; if (fread(&header_len_be, 1, 4, file) != 4) break;
@@ -1213,15 +1230,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                 } else if ((tag_wire >> 3) == 3) datasize = ReadVarint(&ptr, end); else SkipProtobufField(&ptr, end, tag_wire & 7);
                             }
                             free(header_buf);
-                            
                             if (datasize > 64 * 1024 * 1024) break;
                             uint8_t* blob_buf = (uint8_t*)malloc(datasize); if (fread(blob_buf, 1, datasize, file) != datasize) { free(blob_buf); break; }
 
                             if (strcmp(blob_type, "OSMData") == 0) {
-                                ptr = blob_buf; end = blob_buf + datasize;
-                                uint64_t raw_size = 0, zlib_size = 0, raw_len = 0; 
-                                uint8_t *zlib_data = NULL, *raw_data = NULL;
-
+                                ptr = blob_buf; end = blob_buf + datasize; uint64_t raw_size = 0, zlib_size = 0, raw_len = 0; uint8_t *zlib_data = NULL, *raw_data = NULL;
                                 while (ptr < end) {
                                     uint64_t tag_wire = ReadVarint(&ptr, end);
                                     if ((tag_wire >> 3) == 1) { raw_len = ReadVarint(&ptr, end); raw_data = (uint8_t*)ptr; ptr += raw_len; }
@@ -1229,7 +1242,6 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                     else if ((tag_wire >> 3) == 3) { zlib_size = ReadVarint(&ptr, end); zlib_data = (uint8_t*)ptr; ptr += zlib_size; } 
                                     else SkipProtobufField(&ptr, end, tag_wire & 7);
                                 }
-
                                 if (zlib_data && raw_size > 0) {
                                     uint8_t* uncompressed = (uint8_t*)malloc(raw_size); unsigned long dest_len = raw_size;
                                     if (mz_uncompress(uncompressed, &dest_len, zlib_data, zlib_size) == MZ_OK) ProcessPrimitiveBlock(uncompressed, dest_len, extract_mode, tmpOut);
@@ -1244,21 +1256,16 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     SetStatus("Pass 3: Sequential Ping-Pong Resolution...");
                     FILE* fnodes = fopen(nodes_tmp_name, "rb"); if (!fnodes) { free(road_samples); return 1; }
                     char* io_node_buf = malloc(IO_BUF_SIZE); if (io_node_buf) setvbuf(fnodes, io_node_buf, _IOFBF, IO_BUF_SIZE);
-
-                    const uint64_t CHUNK_NODES = 15000000; 
-                    PbfNode* chunk = malloc(CHUNK_NODES * sizeof(PbfNode));
+                    const uint64_t CHUNK_NODES = 15000000; PbfNode* chunk = malloc(CHUNK_NODES * sizeof(PbfNode));
                     if (!chunk) { fclose(fnodes); if (io_node_buf) free(io_node_buf); free(road_samples); return 1; }
 
                     uint64_t nodes_read; int node_chunk_idx = 1;
-
                     while ((nodes_read = fread(chunk, sizeof(PbfNode), CHUNK_NODES, fnodes)) > 0) {
                         SetStatus("Pass 3: Resolving Node Chunk %d...", node_chunk_idx++);
                         qsort(chunk, nodes_read, sizeof(PbfNode), CompareNodes);
-
                         FILE* fways_in = fopen(current_ways, "rb"); FILE* fways_out = fopen(next_ways, "wb");
                         char* in_buf = malloc(IO_BUF_SIZE); char* out_buf = malloc(IO_BUF_SIZE);
-                        if (fways_in && in_buf) setvbuf(fways_in, in_buf, _IOFBF, IO_BUF_SIZE);
-                        if (fways_out && out_buf) setvbuf(fways_out, out_buf, _IOFBF, IO_BUF_SIZE);
+                        if (fways_in && in_buf) setvbuf(fways_in, in_buf, _IOFBF, IO_BUF_SIZE); if (fways_out && out_buf) setvbuf(fways_out, out_buf, _IOFBF, IO_BUF_SIZE);
                         if(!fways_in || !fways_out) { if (in_buf) free(in_buf); if (out_buf) free(out_buf); break; }
 
                         while (1) {
@@ -1267,7 +1274,6 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             char* name = NULL; if (nlen > 0) { name = malloc(nlen + 1); if (name) { fread(name, 1, nlen, fways_in); name[nlen] = '\0'; } else FSEEK64(fways_in, nlen, SEEK_CUR); }
                             uint16_t plen; if (fread(&plen, 2, 1, fways_in) != 1) break;
                             char* pcode = NULL; if (plen > 0) { pcode = malloc(plen + 1); if (pcode) { fread(pcode, 1, plen, fways_in); pcode[plen] = '\0'; } else FSEEK64(fways_in, plen, SEEK_CUR); }
-
                             uint32_t ref_count; if (fread(&ref_count, 4, 1, fways_in) != 1) break;
                             if (ref_count == 0 || ref_count > 5000000) { if (name) free(name); if (pcode) free(pcode); break; }
 
@@ -1281,32 +1287,24 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                     if (found) { wnodes[i].lat = found->lat * 1e-7; wnodes[i].lon = found->lon * 1e-7; wnodes[i].id = 0xFFFFFFFFFFFFFFFFULL; }
                                 }
                             }
-
                             fwrite(&fc, 1, 1, fways_out); fwrite(&nlen, 2, 1, fways_out);
                             if (nlen > 0 && name) fwrite(name, 1, nlen, fways_out);
                             fwrite(&plen, 2, 1, fways_out);
                             if (plen > 0 && pcode) fwrite(pcode, 1, plen, fways_out);
                             fwrite(&ref_count, 4, 1, fways_out); fwrite(wnodes, sizeof(WayNode), ref_count, fways_out);
-
                             if (name) free(name); if (pcode) free(pcode); free(wnodes);
                         }
-                        fclose(fways_in); fclose(fways_out);
-                        if (in_buf) free(in_buf); if (out_buf) free(out_buf);
+                        fclose(fways_in); fclose(fways_out); if (in_buf) free(in_buf); if (out_buf) free(out_buf);
                         char* tmp = current_ways; current_ways = next_ways; next_ways = tmp;
                     }
                     free(chunk); fclose(fnodes); if (io_node_buf) free(io_node_buf);
-
-                    remove(ways_resolved_name);
-                    if (rename(current_ways, ways_resolved_name) == 0) {
-                        current_ways = ways_resolved_name;
-                    }
+                    remove(ways_resolved_name); if (rename(current_ways, ways_resolved_name) == 0) current_ways = ways_resolved_name;
                 }
 
                 SetStatus("Pass 4: Extracting raw features to temporary file...");
-                FILE* fways = fopen(current_ways, "rb"); f_raw = fopen(raw_tmp_name, "wb");
-                char* io_final_in = malloc(IO_BUF_SIZE);
-                if (fways && io_final_in) setvbuf(fways, io_final_in, _IOFBF, IO_BUF_SIZE);
-                if (!fways || !f_raw) { if (io_final_in) free(io_final_in); free(road_samples); return 1; }
+                FILE* fways = fopen(current_ways, "rb"); f_raw = fopen(raw_tmp_name, "wb"); FILE* f_sort = fopen(sort_tmp_name, "wb");
+                char* io_final_in = malloc(IO_BUF_SIZE); if (fways && io_final_in) setvbuf(fways, io_final_in, _IOFBF, IO_BUF_SIZE);
+                if (!fways || !f_raw || !f_sort) { if (io_final_in) free(io_final_in); free(road_samples); return 1; }
 
                 while (1) {
                     uint8_t fc; if (fread(&fc, 1, 1, fways) != 1) break;
@@ -1328,22 +1326,14 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
                             for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 50) {
                                 if (road_sample_cnt >= road_sample_cap) {
-                                    uint32_t new_cap = road_sample_cap * 2;
-                                    WayNode* safe = realloc(road_samples, new_cap * sizeof(WayNode));
-                                    if (!safe) {
-                                        SetStatus("Error: Out of memory allocating road samples.");
-                                        break;
-                                    }
-                                    road_samples = safe;
-                                    road_sample_cap = new_cap;
-                                }
-                                road_samples[road_sample_cnt++] = wnodes[s_idx];
+                                    uint32_t new_cap = road_sample_cap * 2; WayNode* safe = realloc(road_samples, new_cap * sizeof(WayNode));
+                                    if (!safe) break; road_samples = safe; road_sample_cap = new_cap;
+                                } road_samples[road_sample_cnt++] = wnodes[s_idx];
                             }
                         }
 
                         if (fc == CLASS_COASTLINE) {
-                            double dx = wnodes[0].lon - wnodes[ref_count-1].lon;
-                            double dy = wnodes[0].lat - wnodes[ref_count-1].lat;
+                            double dx = wnodes[0].lon - wnodes[ref_count-1].lon, dy = wnodes[0].lat - wnodes[ref_count-1].lat;
                             bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
 
                             if (is_closed) {
@@ -1353,36 +1343,26 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                     if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon; if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
                                     if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat; if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
                                 }
-                                bool in_bbox = true;
-                                if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
+                                bool in_bbox = true; if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                                 if (!g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-                                if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, CLASS_LAND, &sort_entries, &written_feats, &feature_capacity);
+                                if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, CLASS_LAND, f_sort, &written_feats);
                                 if (name) free(name); if (pcode) free(pcode); free(wnodes);
                             } else {
-                                if (coast_cnt >= coast_cap) {
-                                    coast_cap = coast_cap == 0 ? 65536 : coast_cap * 2;
-                                    coasts = realloc(coasts, coast_cap * sizeof(AccumWay));
-                                }
+                                if (coast_cnt >= coast_cap) { coast_cap = coast_cap == 0 ? 65536 : coast_cap * 2; coasts = realloc(coasts, coast_cap * sizeof(AccumWay)); }
                                 coasts[coast_cnt].name = name; coasts[coast_cnt].pcode = pcode; coasts[coast_cnt].count = ref_count; coasts[coast_cnt].nodes = wnodes; coasts[coast_cnt].merged = false; coasts[coast_cnt].fc = fc; coast_cnt++;
                             }
                         } else if (fc == CLASS_WATER || fc == CLASS_PARK || fc == CLASS_LAND) {
-                            double dx = wnodes[0].lon - wnodes[ref_count-1].lon;
-                            double dy = wnodes[0].lat - wnodes[ref_count-1].lat;
+                            double dx = wnodes[0].lon - wnodes[ref_count-1].lon, dy = wnodes[0].lat - wnodes[ref_count-1].lat;
                             bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
                             if (is_closed) wnodes[ref_count-1] = wnodes[0];
-
                             double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
                             for (uint32_t i = 0; i < ref_count; i++) {
                                 if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon; if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
                                 if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat; if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
                             }
-                            bool in_bbox = true;
-                            if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
+                            bool in_bbox = true; if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                             if (is_closed && !g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-
-                            if (in_bbox) {
-                                WriteRawFeature(f_raw, wnodes, ref_count, is_closed, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
-                            }
+                            if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, is_closed, name, pcode, fc, f_sort, &written_feats);
                             if (name) free(name); if (pcode) free(pcode); free(wnodes);
                         } else {
                             double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
@@ -1391,7 +1371,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                 if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat; if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
                             }
                             bool in_bbox = true; if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
-                            if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, false, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
+                            if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, false, name, pcode, fc, f_sort, &written_feats);
                             if (name) free(name); if (pcode) free(pcode); if (wnodes) free(wnodes);
                         }
                     } else { if (name) free(name); if (pcode) free(pcode); free(wnodes); }
@@ -1403,8 +1383,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (f_cst_out) {
                         fwrite(&raw_noncoast_sz, 8, 1, f_cst_out); fwrite(&coast_cnt, 4, 1, f_cst_out);
                         for (uint32_t i = 0; i < coast_cnt; i++) {
-                            uint8_t nlen = coasts[i].name ? (uint8_t)strlen(coasts[i].name) : 0;
-                            uint8_t plen = coasts[i].pcode ? (uint8_t)strlen(coasts[i].pcode) : 0;
+                            uint8_t nlen = coasts[i].name ? (uint8_t)strlen(coasts[i].name) : 0, plen = coasts[i].pcode ? (uint8_t)strlen(coasts[i].pcode) : 0;
                             fwrite(&nlen, 1, 1, f_cst_out); if (nlen) fwrite(coasts[i].name, 1, nlen, f_cst_out);
                             fwrite(&plen, 1, 1, f_cst_out); if (plen) fwrite(coasts[i].pcode, 1, plen, f_cst_out);
                             fwrite(&coasts[i].count, 4, 1, f_cst_out); fwrite(coasts[i].nodes, sizeof(WayNode), coasts[i].count, f_cst_out); fwrite(&coasts[i].fc, 1, 1, f_cst_out);
@@ -1412,12 +1391,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         fclose(f_cst_out);
                     }
                 }
-                fclose(fways); if (io_final_in) free(io_final_in);
+                fclose(fways); if (io_final_in) free(io_final_in); fclose(f_sort);
             }
 
             if (coast_cnt > 0) {
                 SetStatus("Pass 4b: Outward Seed-and-Grow Coastline Assembly (%u ways)...", coast_cnt);
-
                 double ext_min_lon = 180.0, ext_max_lon = -180.0, ext_min_lat = 90.0, ext_max_lat = -90.0;
                 for (uint32_t i = 0; i < coast_cnt; i++) {
                     if (coasts[i].merged) continue;
@@ -1434,37 +1412,28 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (road_samples[i].lat < ext_min_lat) ext_min_lat = road_samples[i].lat;
                     if (road_samples[i].lat > ext_max_lat) ext_max_lat = road_samples[i].lat;
                 }
-                ext_min_lon -= 0.002; ext_max_lon += 0.002;
-                ext_min_lat -= 0.002; ext_max_lat += 0.002;
+                ext_min_lon -= 0.002; ext_max_lon += 0.002; ext_min_lat -= 0.002; ext_max_lat += 0.002;
 
-                uint32_t water_poly_cap = 0, water_poly_cnt = 0;
-                AccumWay* water_polys = NULL;
-
+                uint32_t water_poly_cap = 0, water_poly_cnt = 0; AccumWay* water_polys = NULL;
                 if (strlen(g_ShapefileFile) > 0) {
                     SetStatus("Extracting Water Shapefile for boundary stitching...");
                     FILE* f_water_tmp = fopen("water_bounds.tmp", "wb+");
                     if (f_water_tmp) {
-                        uint64_t dummy_feats = 0; uint32_t dummy_cap = 1000;
-                        SortEntry* dummy_sort = malloc(dummy_cap * sizeof(SortEntry));
-                        ProcessShapefile(g_ShapefileFile, f_water_tmp, &dummy_sort, &dummy_feats, &dummy_cap, true, ext_min_lon - 1.0, ext_min_lat - 1.0, ext_max_lon + 1.0, ext_max_lat + 1.0);
-                        free(dummy_sort);
+                        uint64_t dummy_feats = 0; FILE* f_dummy_sort = fopen("dummy_sort.tmp", "wb");
+                        ProcessShapefile(g_ShapefileFile, f_water_tmp, f_dummy_sort, &dummy_feats, true, ext_min_lon - 1.0, ext_min_lat - 1.0, ext_max_lon + 1.0, ext_max_lat + 1.0);
+                        if (f_dummy_sort) fclose(f_dummy_sort); remove("dummy_sort.tmp");
 
-                        FSEEK64(f_water_tmp, 0, SEEK_SET);
-                        int64_t w_file_sz = GetFileSize64("water_bounds.tmp");
+                        FSEEK64(f_water_tmp, 0, SEEK_SET); int64_t w_file_sz = GetFileSize64("water_bounds.tmp");
                         water_poly_cap = 1024; water_polys = malloc(water_poly_cap * sizeof(AccumWay));
-                        
                         while (FTELL64(f_water_tmp) < w_file_sz) {
                             uint32_t t_len; if (fread(&t_len, 4, 1, f_water_tmp) != 1) break;
                             uint8_t fc, area; fread(&fc, 1, 1, f_water_tmp); fread(&area, 1, 1, f_water_tmp);
                             uint16_t nl; fread(&nl, 2, 1, f_water_tmp); if (nl) FSEEK64(f_water_tmp, nl, SEEK_CUR);
                             uint16_t pl; fread(&pl, 2, 1, f_water_tmp); if (pl) FSEEK64(f_water_tmp, pl, SEEK_CUR);
                             uint32_t r_cnt; fread(&r_cnt, 4, 1, f_water_tmp);
-                            WayNode* w_nodes = malloc(r_cnt * sizeof(WayNode));
-                            fread(w_nodes, sizeof(WayNode), r_cnt, f_water_tmp);
-                            
+                            WayNode* w_nodes = malloc(r_cnt * sizeof(WayNode)); fread(w_nodes, sizeof(WayNode), r_cnt, f_water_tmp);
                             if (water_poly_cnt >= water_poly_cap) { water_poly_cap *= 2; water_polys = realloc(water_polys, water_poly_cap * sizeof(AccumWay)); }
-                            water_polys[water_poly_cnt].nodes = w_nodes; water_polys[water_poly_cnt].count = r_cnt;
-                            water_poly_cnt++;
+                            water_polys[water_poly_cnt].nodes = w_nodes; water_polys[water_poly_cnt].count = r_cnt; water_poly_cnt++;
                         }
                         fclose(f_water_tmp); remove("water_bounds.tmp");
                     }
@@ -1472,32 +1441,31 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
 
                 AssembleAndCloseCoastlinesOutward(coasts, coast_cnt, water_polys, water_poly_cnt, road_samples, road_sample_cnt, ext_min_lon, ext_max_lon, ext_min_lat, ext_max_lat);
 
+                FILE* f_sort = fopen(sort_tmp_name, "ab");
                 for (uint32_t i = 0; i < coast_cnt; i++) {
                     if (coasts[i].merged || coasts[i].count < 3) {
-                        if (coasts[i].name) free(coasts[i].name);
-                        if (coasts[i].pcode) free(coasts[i].pcode);
-                        if (coasts[i].nodes) free(coasts[i].nodes);
+                        if (coasts[i].name) free(coasts[i].name); if (coasts[i].pcode) free(coasts[i].pcode); if (coasts[i].nodes) free(coasts[i].nodes);
                         continue;
                     }
                     uint8_t out_fc = (coasts[i].fc == CLASS_COASTLINE) ? CLASS_LAND : coasts[i].fc;
-                    WriteRawFeature(f_raw, coasts[i].nodes, coasts[i].count, true, coasts[i].name, coasts[i].pcode, out_fc, &sort_entries, &written_feats, &feature_capacity);
-                    if (coasts[i].name) free(coasts[i].name);
-                    if (coasts[i].pcode) free(coasts[i].pcode);
-                    free(coasts[i].nodes);
+                    WriteRawFeature(f_raw, coasts[i].nodes, coasts[i].count, true, coasts[i].name, coasts[i].pcode, out_fc, f_sort, &written_feats);
+                    if (coasts[i].name) free(coasts[i].name); if (coasts[i].pcode) free(coasts[i].pcode); free(coasts[i].nodes);
                 }
-
+                if (f_sort) fclose(f_sort);
                 if (water_polys) { for (uint32_t wp = 0; wp < water_poly_cnt; wp++) free(water_polys[wp].nodes); free(water_polys); }
                 free(coasts);
             }
 
-            fwrite(&EOF_MARKER, 4, 1, f_raw);
-            fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
+            fwrite(&EOF_MARKER, 4, 1, f_raw); fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
         }
     }
     free(road_samples);
 
-    SetStatus("Pass 5: Spatial Clustering (Morton Z-Curve Sorting)...");
-    qsort(sort_entries, written_feats, sizeof(SortEntry), CompareSortEntry);
+    SetStatus("Pass 5: External Spatial Clustering (Morton Z-Curve Sorting)...");
+    if (!ExternalMergeSort(sort_tmp_name, sorted_tmp_name)) {
+        SetStatus("Fatal Error: External sorting failed.");
+        return 1;
+    }
 
     SetStatus("Pass 6: High-Res QJMC Block Compression...");
     FILE* f_qjmc = fopen(out_filename, "wb"); if (!f_qjmc) return 1;
@@ -1516,8 +1484,12 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
     double c_min_lon = 180, c_max_lon = -180, c_min_lat = 90, c_max_lat = -90;
     uint32_t raw_cap = 1024 * 1024; uint8_t* raw_buf = malloc(raw_cap);
 
+    FILE* f_sorted = fopen(sorted_tmp_name, "rb");
+    if (!f_sorted) return 1;
+
     for (uint64_t i = 0; i < written_feats; i++) {
-        FSEEK64(f_raw, sort_entries[i].offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
+        SortEntry entry; fread(&entry, sizeof(SortEntry), 1, f_sorted);
+        FSEEK64(f_raw, entry.offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
         if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); } fread(raw_buf, 1, total_len, f_raw);
         
         uint8_t* rptr = raw_buf; uint8_t fc = *rptr++; uint8_t is_area = *rptr++;
@@ -1547,15 +1519,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         if (f_cnt > 0 && required_uncomp > flush_threshold) {
             uint32_t total_uncomp = 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float) + s_len;
             memcpy(uncomp_buf, &f_cnt, 4); memcpy(uncomp_buf + 4, &p_cnt, 4); memcpy(uncomp_buf + 8, &s_len, 4);
-            memcpy(uncomp_buf + 12, feats_buf, f_cnt * sizeof(PFeat));
-            memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat), pts_buf, p_cnt * sizeof(float));
-            memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float), str_buf, s_len);
-
+            memcpy(uncomp_buf + 12, feats_buf, f_cnt * sizeof(PFeat)); memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat), pts_buf, p_cnt * sizeof(float)); memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float), str_buf, s_len);
             int comp_size = lzav_compress_default(uncomp_buf, comp_buf, total_uncomp, lzav_compress_bound(buf_cap));
             if (chunk_idx >= meta_cap) { meta_cap *= 2; meta = realloc(meta, meta_cap * sizeof(ChunkMetaDisk)); }
             meta[chunk_idx].min_lon = c_min_lon; meta[chunk_idx].max_lon = c_max_lon; meta[chunk_idx].min_lat = c_min_lat; meta[chunk_idx].max_lat = c_max_lat;
             meta[chunk_idx].offset = FTELL64(f_qjmc); meta[chunk_idx].comp_size = comp_size; meta[chunk_idx].uncomp_size = total_uncomp;
-            
             fwrite(comp_buf, 1, comp_size, f_qjmc); chunk_idx++;
             f_cnt = 0; p_cnt = 0; s_len = 1; str_buf[0] = 0; c_min_lon = 180; c_max_lon = -180; c_min_lat = 90; c_max_lat = -90;
             required_uncomp = 12 + (f_cnt + 1) * sizeof(PFeat) + (p_cnt + ref_count * 2) * sizeof(float) + s_len + nlen + plen + 2;
@@ -1584,8 +1552,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         } 
         feats_buf[f_cnt].min_lon = m_lon; feats_buf[f_cnt].max_lon = x_lon;
         feats_buf[f_cnt].min_lat = m_lat; feats_buf[f_cnt].max_lat = x_lat;
-        f_cnt++;
-        free(wnodes);
+        f_cnt++; free(wnodes);
     }
 
     if (f_cnt > 0) {
@@ -1608,9 +1575,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
 
     f_cnt = 0; p_cnt = 0; s_len = 1; str_buf[0] = 0;
     c_min_lon = 180; c_max_lon = -180; c_min_lat = 90; c_max_lat = -90;
+    FSEEK64(f_sorted, 0, SEEK_SET);
 
     for (uint64_t i = 0; i < written_feats; i++) {
-        FSEEK64(f_raw, sort_entries[i].offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
+        SortEntry entry; fread(&entry, sizeof(SortEntry), 1, f_sorted);
+        FSEEK64(f_raw, entry.offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
         if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); } fread(raw_buf, 1, total_len, f_raw);
         
         uint8_t* rptr = raw_buf; uint8_t fc = *rptr++; uint8_t is_area = *rptr++;
@@ -1636,28 +1605,19 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
             if(wnodes[j].lon < f_min_lon) f_min_lon = wnodes[j].lon; if(wnodes[j].lon > f_max_lon) f_max_lon = wnodes[j].lon;
             if(wnodes[j].lat < f_min_lat) f_min_lat = wnodes[j].lat; if(wnodes[j].lat > f_max_lat) f_max_lat = wnodes[j].lat;
         }
-        if (is_area && (f_max_lon - f_min_lon < 0.02) && (f_max_lat - f_min_lat < 0.02)) {
-            free(wnodes); continue;
-        }
+        if (is_area && (f_max_lon - f_min_lon < 0.02) && (f_max_lat - f_min_lat < 0.02)) { free(wnodes); continue; }
+
+        double dist_threshold = 0.0001 * (100.0 / (g_SimpLowPoly > 0 ? g_SimpLowPoly : 1));
+        if (g_CfgNoRoads && (fc == CLASS_LAND || fc == CLASS_COASTLINE)) dist_threshold = 0.0001 * (100.0 / (g_SimpNoRoads > 0 ? g_SimpNoRoads : 1));
 
         WayNode* dec_nodes = malloc(ref_count * sizeof(WayNode)); uint32_t dec_cnt = 0; dec_nodes[dec_cnt++] = wnodes[0];
         for (uint32_t k = 1; k < ref_count - 1; k++) {
             double dx = wnodes[k].lon - dec_nodes[dec_cnt-1].lon, dy = wnodes[k].lat - dec_nodes[dec_cnt-1].lat;
-            if (dx*dx + dy*dy > 0.0001) dec_nodes[dec_cnt++] = wnodes[k]; 
+            if (dx*dx + dy*dy > dist_threshold) dec_nodes[dec_cnt++] = wnodes[k]; 
         }
         if (ref_count > 1) {
             double dx = wnodes[ref_count-1].lon - dec_nodes[dec_cnt-1].lon, dy = wnodes[ref_count-1].lat - dec_nodes[dec_cnt-1].lat;
-            if (dx*dx + dy*dy > 0.0000001) dec_nodes[dec_cnt++] = wnodes[ref_count-1];
-        }
-
-        WayNode* final_dec_nodes = malloc(dec_cnt * sizeof(WayNode));
-        dec_cnt = DecimateNodes(dec_nodes, dec_cnt, final_dec_nodes, g_SimpLowPoly);
-        free(dec_nodes); dec_nodes = final_dec_nodes;
-
-        if (g_CfgNoRoads && (fc == CLASS_LAND || fc == CLASS_COASTLINE)) {
-            WayNode* tmp = malloc(dec_cnt * sizeof(WayNode));
-            dec_cnt = DecimateNodes(dec_nodes, dec_cnt, tmp, g_SimpNoRoads);
-            free(dec_nodes); dec_nodes = tmp;
+            if (dx*dx + dy*dy > (dist_threshold / 10.0)) dec_nodes[dec_cnt++] = wnodes[ref_count-1];
         }
 
         uint32_t required_uncomp = 12 + (f_cnt + 1) * sizeof(PFeat) + (p_cnt + dec_cnt * 2) * sizeof(float) + s_len + nlen + plen + 2;
@@ -1665,12 +1625,10 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
             uint32_t total_uncomp = 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float) + s_len;
             memcpy(uncomp_buf, &f_cnt, 4); memcpy(uncomp_buf + 4, &p_cnt, 4); memcpy(uncomp_buf + 8, &s_len, 4);
             memcpy(uncomp_buf + 12, feats_buf, f_cnt * sizeof(PFeat)); memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat), pts_buf, p_cnt * sizeof(float)); memcpy(uncomp_buf + 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float), str_buf, s_len);
-
             int comp_size = lzav_compress_default(uncomp_buf, comp_buf, total_uncomp, lzav_compress_bound(buf_cap));
             if (over_cnt >= over_cap) { over_cap *= 2; over_meta = realloc(over_meta, over_cap * sizeof(ChunkMetaDisk)); }
             over_meta[over_cnt].min_lon = c_min_lon; over_meta[over_cnt].max_lon = c_max_lon; over_meta[over_cnt].min_lat = c_min_lat; over_meta[over_cnt].max_lat = c_max_lat;
             over_meta[over_cnt].offset = FTELL64(f_qjmc); over_meta[over_cnt].comp_size = comp_size; over_meta[over_cnt].uncomp_size = total_uncomp;
-            
             fwrite(comp_buf, 1, comp_size, f_qjmc); over_cnt++;
             f_cnt = 0; p_cnt = 0; s_len = 1; str_buf[0] = 0; c_min_lon = 180; c_max_lon = -180; c_min_lat = 90; c_max_lat = -90;
             required_uncomp = 12 + (f_cnt + 1) * sizeof(PFeat) + (p_cnt + dec_cnt * 2) * sizeof(float) + s_len + nlen + plen + 2;
@@ -1699,9 +1657,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         } 
         feats_buf[f_cnt].min_lon = m_lon; feats_buf[f_cnt].max_lon = x_lon;
         feats_buf[f_cnt].min_lat = m_lat; feats_buf[f_cnt].max_lat = x_lat;
-        f_cnt++; 
-        free(dec_nodes);
-        free(wnodes);
+        f_cnt++; free(dec_nodes); free(wnodes);
     }
 
     if (f_cnt > 0) {
@@ -1722,34 +1678,34 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
     fwrite(&over_dir_off, 8, 1, f_qjmc); fwrite(&over_cnt, 4, 1, f_qjmc);
     fwrite("QJM2", 1, 4, f_qjmc);
 
-    fclose(f_qjmc);
-    free(uncomp_buf); free(comp_buf); free(raw_buf); free(meta); free(sort_entries); free(over_meta);
+    fclose(f_sorted); fclose(f_qjmc);
+    free(uncomp_buf); free(comp_buf); free(raw_buf); free(meta); free(over_meta);
     free(feats_buf); free(pts_buf); free(str_buf); fclose(f_raw);
+    remove(raw_tmp_name); remove(sort_tmp_name); remove(sorted_tmp_name);
 
     SetStatus("Done! Wrote %llu features to %s", (unsigned long long)written_feats, out_filename);
     return 0;
 }
+
 static DWORD WINAPI CompileThread(LPVOID lpParam) {
-ThreadArgs* args = (ThreadArgs*)lpParam;
-EnableWindow(hBtnRun, FALSE);
-EnableWindow(hBtnDelTmp, FALSE);
-SetStatus("Compilation started...");
-int result = RunCompilation(args->inFile, args->outFile, args->refFile, false, 0, 0, 0, 0);
+    ThreadArgs* args = (ThreadArgs*)lpParam;
+    EnableWindow(hBtnRun, FALSE);
+    EnableWindow(hBtnDelTmp, FALSE);
+    SetStatus("Compilation started...");
+    int result = RunCompilation(args->inFile, args->outFile, args->refFile, false, 0, 0, 0, 0);
 
-if (g_RefPolys) {
-    for (uint32_t i = 0; i < g_RefPolyCount; i++) free(g_RefPolys[i].nodes);
-    free(g_RefPolys);
-    g_RefPolys = NULL;
-    g_RefPolyCount = 0;
-}
+    if (g_RefPolys) {
+        for (uint32_t i = 0; i < g_RefPolyCount; i++) free(g_RefPolys[i].nodes);
+        free(g_RefPolys);
+        g_RefPolys = NULL;
+        g_RefPolyCount = 0;
+    }
 
-if (result != 0) SetStatus("Compilation failed.");
-EnableWindow(hBtnRun, TRUE);
-EnableWindow(hBtnDelTmp, TRUE);
-free(args);
-return 0;
-
-
+    if (result != 0) SetStatus("Compilation failed.");
+    EnableWindow(hBtnRun, TRUE);
+    EnableWindow(hBtnDelTmp, TRUE);
+    free(args);
+    return 0;
 }
 
 static BOOL CALLBACK SetFontProc(HWND hwnd, LPARAM lParam) { SendMessageA(hwnd, WM_SETFONT, lParam, TRUE); return TRUE; }
@@ -1888,6 +1844,7 @@ switch (msg) {
 } 
 return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
     
