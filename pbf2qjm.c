@@ -1414,32 +1414,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                 }
                 ext_min_lon -= 0.002; ext_max_lon += 0.002; ext_min_lat -= 0.002; ext_max_lat += 0.002;
 
-                uint32_t water_poly_cap = 0, water_poly_cnt = 0; AccumWay* water_polys = NULL;
-                if (strlen(g_ShapefileFile) > 0) {
-                    SetStatus("Extracting Water Shapefile for boundary stitching...");
-                    FILE* f_water_tmp = fopen("water_bounds.tmp", "wb+");
-                    if (f_water_tmp) {
-                        uint64_t dummy_feats = 0; FILE* f_dummy_sort = fopen("dummy_sort.tmp", "wb");
-                        ProcessShapefile(g_ShapefileFile, f_water_tmp, f_dummy_sort, &dummy_feats, true, ext_min_lon - 1.0, ext_min_lat - 1.0, ext_max_lon + 1.0, ext_max_lat + 1.0);
-                        if (f_dummy_sort) fclose(f_dummy_sort); remove("dummy_sort.tmp");
-
-                        FSEEK64(f_water_tmp, 0, SEEK_SET); int64_t w_file_sz = GetFileSize64("water_bounds.tmp");
-                        water_poly_cap = 1024; water_polys = malloc(water_poly_cap * sizeof(AccumWay));
-                        while (FTELL64(f_water_tmp) < w_file_sz) {
-                            uint32_t t_len; if (fread(&t_len, 4, 1, f_water_tmp) != 1) break;
-                            uint8_t fc, area; fread(&fc, 1, 1, f_water_tmp); fread(&area, 1, 1, f_water_tmp);
-                            uint16_t nl; fread(&nl, 2, 1, f_water_tmp); if (nl) FSEEK64(f_water_tmp, nl, SEEK_CUR);
-                            uint16_t pl; fread(&pl, 2, 1, f_water_tmp); if (pl) FSEEK64(f_water_tmp, pl, SEEK_CUR);
-                            uint32_t r_cnt; fread(&r_cnt, 4, 1, f_water_tmp);
-                            WayNode* w_nodes = malloc(r_cnt * sizeof(WayNode)); fread(w_nodes, sizeof(WayNode), r_cnt, f_water_tmp);
-                            if (water_poly_cnt >= water_poly_cap) { water_poly_cap *= 2; water_polys = realloc(water_polys, water_poly_cap * sizeof(AccumWay)); }
-                            water_polys[water_poly_cnt].nodes = w_nodes; water_polys[water_poly_cnt].count = r_cnt; water_poly_cnt++;
-                        }
-                        fclose(f_water_tmp); remove("water_bounds.tmp");
-                    }
-                }
-
-                AssembleAndCloseCoastlinesOutward(coasts, coast_cnt, water_polys, water_poly_cnt, road_samples, road_sample_cnt, ext_min_lon, ext_max_lon, ext_min_lat, ext_max_lat);
+                AssembleAndCloseCoastlinesOutward(coasts, coast_cnt, NULL, 0, road_samples, road_sample_cnt, ext_min_lon, ext_max_lon, ext_min_lat, ext_max_lat);
 
                 FILE* f_sort = fopen(sort_tmp_name, "ab");
                 for (uint32_t i = 0; i < coast_cnt; i++) {
@@ -1452,8 +1427,14 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (coasts[i].name) free(coasts[i].name); if (coasts[i].pcode) free(coasts[i].pcode); free(coasts[i].nodes);
                 }
                 if (f_sort) fclose(f_sort);
-                if (water_polys) { for (uint32_t wp = 0; wp < water_poly_cnt; wp++) free(water_polys[wp].nodes); free(water_polys); }
                 free(coasts);
+            }
+
+            if (strlen(g_ShapefileFile) > 0) {
+                SetStatus("  -> Injecting Shapefile Coastlines from %s...", g_ShapefileFile);
+                FILE* f_sort = fopen(sort_tmp_name, "ab");
+                ProcessShapefile(g_ShapefileFile, f_raw, f_sort, &written_feats, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
+                if (f_sort) fclose(f_sort);
             }
 
             fwrite(&EOF_MARKER, 4, 1, f_raw); fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
