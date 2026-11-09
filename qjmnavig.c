@@ -101,10 +101,27 @@ static LoadedMapFile g_LoadedFiles[64];
 
 static int g_LoadedFileCount = 0;
 
+static bool g_InteractiveCanvas = false;
+static int g_AllocCanvasW = 0, g_AllocCanvasH = 0;
+
 typedef struct { uint32_t id; float lon; float lat; } SNode;
 typedef struct {
     char maps_str[4096];
 } LoadThreadArgs;
+
+typedef struct {
+    POINT* pts;
+    DWORD* counts;
+    uint32_t pt_cnt, pt_cap;
+    uint32_t poly_cnt, poly_cap;
+} PolyBatch;
+
+typedef struct {
+    char txt[64];
+    uint64_t hash;
+    int p1x, p1y, p2x, p2y;
+    uint8_t is_main;
+} LabelCand;
 
 static void CalculateRoute(void);
 static void UpdateLegendWindow(HWND hwndMain);
@@ -219,17 +236,26 @@ static inline uint64_t HashLabelStr(const char* s) {
 }
 
 static bool HasNonWorldChunks(void) {
-    for (uint32_t i = 0; i < g_ChunkCount; i++) {
-        if (g_Chunks[i].file != g_WorldMapPtr) return true;
+    static uint32_t cached_cnt = 0xFFFFFFFF;
+    static FILE* cached_world = (FILE*)1;
+    static bool cached_res = false;
+    if (g_ChunkCount == cached_cnt && g_WorldMapPtr == cached_world) {
+        return cached_res;
     }
-    return false;
+    cached_res = false;
+    for (uint32_t i = 0; i < g_ChunkCount; i++) {
+        if (g_Chunks[i].file != g_WorldMapPtr) {
+            cached_res = true;
+            break;
+        }
+    }
+    cached_cnt = g_ChunkCount;
+    cached_world = g_WorldMapPtr;
+    return cached_res;
 }
 
 static bool HasDetailedChunks(void) {
-    for (uint32_t i = 0; i < g_ChunkCount; i++) {
-        if (g_Chunks[i].file != g_WorldMapPtr) return true;
-    }
-    return false;
+    return HasNonWorldChunks();
 }
 
 static bool IsFeatureVisible(uint32_t c_idx, const PFeat* f, double zoom) {
@@ -310,34 +336,6 @@ static bool IsChunkActiveForAreas(uint32_t c_idx, double zoom) {
     // Detailed zoom (or Edit Mode above worldMap zoom)
     if (is_world_chunk) return false;
     return !mc->is_overview;
-}
-
-static inline void NavLatLonToCanvasScreen(double lon, double lat, int w, int h, double* px, double* py) {
-    int canvas_w = w * 3, canvas_h = h * 3;
-    double half_cw = canvas_w * 0.5 + g_PanX;
-    double half_ch = canvas_h * 0.5 + g_PanY;
-    double off_x = half_cw - g_CenterLon * g_Zoom;
-    double off_y = half_ch + g_CenterLat * g_Zoom;
-    double dsx, dsy;
-
-    if (fabs(g_Rotation) > 1e-6) {
-        double dx = (lon - g_CenterLon) * g_Zoom;
-        double dy = (g_CenterLat - lat) * g_Zoom;
-        double c = cos(g_Rotation), s = sin(g_Rotation);
-        dsx = half_cw + dx * c - dy * s;
-        dsy = half_ch + dx * s + dy * c;
-    } else {
-        dsx = lon * g_Zoom + off_x;
-        dsy = lat * (-g_Zoom) + off_y;
-    }
-
-    double dpan_x = g_PanX - g_CanvasPanX;
-    double dpan_y = g_PanY - g_CanvasPanY;
-    int src_x = w - (int)dpan_x;
-    int src_y = h - (int)dpan_y;
-
-    *px = dsx - src_x;
-    *py = dsy - src_y;
 }
 
 static bool PointInPolygonPts(const float* pts, uint32_t pt_cnt, double lon, double lat) {
@@ -498,19 +496,6 @@ int cmp_snode(const void* a, const void* b) {
     return (d > 0) - (d < 0);
 }
 
-static inline void NavLatLonToScreen(double lon, double lat, int w, int h, double pan_x, double pan_y, double zoom, double* px, double* py) {
-    double dx = (lon - g_CenterLon) * zoom;
-    double dy = -(lat - g_CenterLat) * zoom;
-    if (fabs(g_Rotation) > 1e-6) {
-        double c = cos(g_Rotation), s = sin(g_Rotation);
-        double rx = dx * c - dy * s;
-        double ry = dx * s + dy * c;
-        dx = rx; dy = ry;
-    }
-    *px = (w / 2.0) + dx + pan_x;
-    *py = (h / 2.0) + dy + pan_y;
-}
-
 static inline void NavScreenToLatLon(int x, int y, int w, int h, double* lon, double* lat) {
     double dx = x - (w / 2.0) - g_PanX;
     double dy = y - (h / 2.0) - g_PanY;
@@ -524,6 +509,475 @@ static inline void NavScreenToLatLon(int x, int y, int w, int h, double* lon, do
     *lat = g_CenterLat - dy / g_Zoom;
 }
 
+static inline void NavLatLonToScreen(double lon, double lat, int w, int h, double pan_x, double pan_y, double zoom, double* px, double* py) {
+    double dx = (lon - g_CenterLon) * zoom;
+    double dy = -(lat - g_CenterLat) * zoom;
+    if (fabs(g_Rotation) > 1e-6) {
+        double c = cos(g_Rotation), s = sin(g_Rotation);
+        double rx = dx * c - dy * s;
+        double ry = dx * s + dy * c;
+        dx = rx; dy = ry;
+    }
+    *px = (w / 2.0) + dx + pan_x;
+    *py = (h / 2.0) + dy + pan_y;
+}
+
+static inline void NavLatLonToCanvasScreen(double lon, double lat, int w, int h, double* px, double* py) {
+    NavLatLonToScreen(lon, lat, w, h, g_PanX, g_PanY, g_Zoom, px, py);
+}
+static int SanitizeMapLabel(const char* raw, uint32_t max_rem, char* out, uint32_t out_cap) {
+    if (!raw || max_rem == 0 || out_cap < 2) return 0;
+    uint32_t limit = (max_rem < out_cap - 1) ? max_rem : (out_cap - 1);
+    uint32_t len = 0;
+    bool has_alnum = false;
+    while (len < limit && raw[len] != '\0') {
+        uint8_t c = (uint8_t)raw[len];
+        if (c < 32 || c >= 127) {
+            out[0] = '\0';
+            return 0;
+        }
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            has_alnum = true;
+        }
+        out[len++] = (char)c;
+    }
+    if (len == 0 || len >= limit || raw[len] != '\0' || !has_alnum) {
+        out[0] = '\0';
+        return 0;
+    }
+    out[len] = '\0';
+    return (int)len;
+}
+
+static void ComputeScreenRectLatLonBounds(const RECT* r, int w, int h, double pad_deg,
+                                          double* min_lon, double* max_lon, double* min_lat, double* max_lat) {
+    int xs[4] = { r->left, r->right, r->left, r->right };
+    int ys[4] = { r->top,  r->top,   r->bottom, r->bottom };
+    *min_lon = 1e30; *max_lon = -1e30;
+    *min_lat = 1e30; *max_lat = -1e30;
+    for (int i = 0; i < 4; i++) {
+        double lon, lat;
+        NavScreenToLatLon(xs[i], ys[i], w, h, &lon, &lat);
+        if (lon < *min_lon) *min_lon = lon;
+        if (lon > *max_lon) *max_lon = lon;
+        if (lat < *min_lat) *min_lat = lat;
+        if (lat > *max_lat) *max_lat = lat;
+    }
+    *min_lon -= pad_deg; *max_lon += pad_deg;
+    *min_lat -= pad_deg; *max_lat += pad_deg;
+}
+
+static void RenderCanvasRegion(HWND hwnd, const RECT* r1, const RECT* r2, bool draw_labels) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    if (w <= 0 || h <= 0) return;
+
+    bool is_strip = (r1 != NULL || r2 != NULL);
+
+    if (!is_strip && (fabs(g_PanX) > 0.01 || fabs(g_PanY) > 0.01)) {
+        double new_lon, new_lat;
+        NavScreenToLatLon(w / 2, h / 2, w, h, &new_lon, &new_lat);
+        g_CenterLon = new_lon;
+        g_CenterLat = new_lat;
+        g_PanX = 0.0;
+        g_PanY = 0.0;
+    }
+
+    if (!g_hdcCanvas) {
+        HDC hdc = GetDC(hwnd);
+        g_hdcCanvas = CreateCompatibleDC(hdc);
+        ReleaseDC(hwnd, hdc);
+    }
+    if (g_AllocCanvasW != w || g_AllocCanvasH != h) {
+        if (g_hbmCanvas) DeleteObject(g_hbmCanvas);
+        HDC hdc = GetDC(hwnd);
+        g_hbmCanvas = CreateCompatibleBitmap(hdc, w, h);
+        ReleaseDC(hwnd, hdc);
+        SelectObject(g_hdcCanvas, g_hbmCanvas);
+        g_AllocCanvasW = w;
+        g_AllocCanvasH = h;
+    }
+    g_CanvasW = w;
+    g_CanvasH = h;
+
+    g_CanvasPanX = g_PanX;
+    g_CanvasPanY = g_PanY;
+    g_CanvasZoom = g_Zoom;
+    g_CanvasRot  = g_Rotation;
+    if (!is_strip) g_CanvasDirty = false;
+
+    if (!is_strip && g_HighlightedChunk >= 0 && (uint32_t)g_HighlightedChunk < g_ChunkCount && g_HighlightedFeat >= 0) {
+        bool still_vis = false;
+        uint8_t* h_data = GetChunkData(g_HighlightedChunk);
+        if (h_data) {
+            uint32_t f_cnt = *(uint32_t*)h_data;
+            if ((uint32_t)g_HighlightedFeat < f_cnt) {
+                PFeat* hf = &((PFeat*)(h_data + 12))[g_HighlightedFeat];
+                still_vis = IsFeatureVisible((uint32_t)g_HighlightedChunk, hf, g_Zoom);
+            }
+        }
+        if (!still_vis) {
+            g_HighlightedChunk = -1;
+            g_HighlightedFeat = -1;
+            g_SelectedNode = -1;
+            g_SelectedNode2 = -1;
+        }
+    }
+
+    HRGN hClipRgn = NULL;
+    double pad_deg = 8.0 / g_Zoom;
+    double b1_min_lon = 0, b1_max_lon = 0, b1_min_lat = 0, b1_max_lat = 0;
+    double b2_min_lon = 0, b2_max_lon = 0, b2_min_lat = 0, b2_max_lat = 0;
+    bool has_b1 = false, has_b2 = false;
+
+    HBRUSH bgBrush = CreateSolidBrush(c_Water);
+    if (is_strip) {
+        if (r1) {
+            hClipRgn = CreateRectRgnIndirect(r1);
+            ComputeScreenRectLatLonBounds(r1, w, h, pad_deg, &b1_min_lon, &b1_max_lon, &b1_min_lat, &b1_max_lat);
+            has_b1 = true;
+        }
+        if (r2) {
+            HRGN rgn2 = CreateRectRgnIndirect(r2);
+            if (hClipRgn) {
+                CombineRgn(hClipRgn, hClipRgn, rgn2, RGN_OR);
+                DeleteObject(rgn2);
+            } else {
+                hClipRgn = rgn2;
+            }
+            ComputeScreenRectLatLonBounds(r2, w, h, pad_deg, &b2_min_lon, &b2_max_lon, &b2_min_lat, &b2_max_lat);
+            has_b2 = true;
+        }
+        SelectClipRgn(g_hdcCanvas, hClipRgn);
+        FillRgn(g_hdcCanvas, hClipRgn, bgBrush);
+    } else {
+        RECT full_rc = { 0, 0, w, h };
+        FillRect(g_hdcCanvas, &full_rc, bgBrush);
+        ComputeScreenRectLatLonBounds(&full_rc, w, h, pad_deg, &b1_min_lon, &b1_max_lon, &b1_min_lat, &b1_max_lat);
+        has_b1 = true;
+    }
+    DeleteObject(bgBrush);
+
+    bool has_rot = (fabs(g_Rotation) > 1e-6);
+    double half_cw = w * 0.5 + g_PanX;
+    double half_ch = h * 0.5 + g_PanY;
+    double off_x = half_cw - g_CenterLon * g_Zoom;
+    double off_y = half_ch + g_CenterLat * g_Zoom;
+    double neg_zoom = -g_Zoom;
+    double cos_r = has_rot ? cos(g_Rotation) : 1.0;
+    double sin_r = has_rot ? sin(g_Rotation) : 0.0;
+
+    static POINT* screen_pts = NULL;
+    static uint32_t screen_pts_cap = 0;
+    static PolyBatch batches[3] = {0}; // 0: Coast, 1: Minor Hwy, 2: Main Hwy
+    static LabelCand* label_cands = NULL;
+    static uint32_t label_cand_cap = 0;
+    uint32_t label_cand_cnt = 0;
+
+    for (int b = 0; b < 3; b++) {
+        batches[b].pt_cnt = 0;
+        batches[b].poly_cnt = 0;
+    }
+
+    double main_hwy_min_zoom = g_WorldMapMaxZoom / 3.0;
+    double hwy_zoom_threshold = (g_WorldMapMaxZoom * g_HighwayZoomMult) / 3.0;
+    bool low_poly_mode = (g_Zoom <= g_WorldMapMaxZoom);
+    double min_feat_deg = (g_EditMode ? 0.5 : (low_poly_mode ? 0.75 : 1.5)) / g_Zoom;
+    bool has_non_world = HasNonWorldChunks();
+    bool want_labels = (draw_labels && !is_strip && g_ShowLabels && g_Zoom >= main_hwy_min_zoom);
+
+    HBRUSH hBrWater = CreateSolidBrush(c_Water);
+    HBRUSH hBrLand  = CreateSolidBrush(c_Land);
+    HBRUSH hBrPark  = CreateSolidBrush(c_Park);
+    HPEN   hPenMain = CreatePen(PS_SOLID, 2, c_HwyMain);
+    HPEN   hPenMin  = CreatePen(PS_SOLID, 1, c_HwyMin);
+    HPEN   hPenCoast = CreatePen(PS_SOLID, 1, c_Coast);
+    HPEN   hNullPen = (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH hNullBr  = (HBRUSH)GetStockObject(NULL_BRUSH);
+
+    SelectObject(g_hdcCanvas, hNullPen);
+    HBRUSH currentBrush = NULL;
+
+    EnterCriticalSection(&g_FileCS);
+
+    for (uint32_t c = 0; c < g_ChunkCount; c++) {
+        MapChunk* mc = &g_Chunks[c];
+        bool c_in_b1 = has_b1 && !(mc->max_lon < b1_min_lon || mc->min_lon > b1_max_lon || mc->max_lat < b1_min_lat || mc->min_lat > b1_max_lat);
+        bool c_in_b2 = has_b2 && !(mc->max_lon < b2_min_lon || mc->min_lon > b2_max_lon || mc->max_lat < b2_min_lat || mc->min_lat > b2_max_lat);
+        if (!c_in_b1 && !c_in_b2) continue;
+
+        bool active_areas = IsChunkActiveForAreas(c, g_Zoom);
+        bool active_roads = IsChunkActiveForRoads(c, g_Zoom);
+        if (!active_areas && !active_roads) continue;
+
+        bool is_world_chunk = (mc->file == g_WorldMapPtr && g_WorldMapPtr != NULL);
+
+        uint8_t* data = GetChunkData(c);
+        if (!data) continue;
+        uint32_t uncomp_sz = mc->uncomp_size;
+        uint32_t f_cnt = *(uint32_t*)data;
+        uint32_t p_cnt = *(uint32_t*)(data + 4);
+        uint32_t s_len = *(uint32_t*)(data + 8);
+        uint32_t geom_end = 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float);
+        if (geom_end >= uncomp_sz) s_len = 0;
+        else if (geom_end + s_len > uncomp_sz) s_len = uncomp_sz - geom_end;
+
+        PFeat* feats = (PFeat*)(data + 12);
+        float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
+        char* strings = (char*)((uint8_t*)points + p_cnt * sizeof(float));
+
+        for (uint32_t i = 0; i < f_cnt; i++) {
+            PFeat* f = &feats[i];
+            if (f->pt_cnt < 2 || f->pt_off + f->pt_cnt * 2 > p_cnt) continue;
+            if ((f->max_lon - f->min_lon) < min_feat_deg && (f->max_lat - f->min_lat) < min_feat_deg) continue;
+
+            bool f_in_b1 = c_in_b1 && !(f->max_lon < b1_min_lon || f->min_lon > b1_max_lon || f->max_lat < b1_min_lat || f->min_lat > b1_max_lat);
+            bool f_in_b2 = c_in_b2 && !(f->max_lon < b2_min_lon || f->min_lon > b2_max_lon || f->max_lat < b2_min_lat || f->min_lat > b2_max_lat);
+            if (!f_in_b1 && !f_in_b2) continue;
+
+            if (is_world_chunk && has_non_world && (f->fc == CLASS_HWY_MINOR || f->fc == CLASS_HWY_MAIN)) continue;
+
+            int batch_id = -1;
+            bool draw_area = false;
+            bool check_label = false;
+
+            if (f->is_area) {
+                if (!active_areas || f->pt_cnt < 3) continue;
+                if (!g_EditMode && g_Zoom < 10000.0 && ((f->max_lon - f->min_lon) * g_Zoom < 3.0) && ((f->max_lat - f->min_lat) * g_Zoom < 3.0)) continue;
+                if ((f->fc == CLASS_LAND || f->fc == CLASS_COASTLINE) && g_ShowLand) draw_area = true;
+                else if (f->fc == CLASS_WATER && g_ShowWater) draw_area = true;
+                else if (f->fc == CLASS_PARK && g_ShowPark) draw_area = true;
+                if (!draw_area) continue;
+            } else {
+                if (f->fc == CLASS_COASTLINE) {
+                    if (active_areas && g_ShowCoast) batch_id = 0;
+                } else if (f->fc == CLASS_HWY_MINOR) {
+                    if (active_roads && g_ShowHwyMin && g_Zoom >= hwy_zoom_threshold) batch_id = 1;
+                    if (want_labels && active_roads && g_Zoom >= 5000.0 && f->name_off > 0 && f->name_off < s_len) check_label = true;
+                } else if (f->fc == CLASS_HWY_MAIN) {
+                    if (active_roads && g_ShowHwyMain && g_Zoom >= main_hwy_min_zoom) batch_id = 2;
+                    if (want_labels && active_roads && f->name_off > 0 && f->name_off < s_len) check_label = true;
+                } else if (f->fc == CLASS_PLACE || f->fc == CLASS_POI) {
+                    if (want_labels && active_roads && f->name_off > 0 && f->name_off < s_len) check_label = true;
+                }
+                if (batch_id == -1 && !check_label) continue;
+            }
+
+            POINT* dst_pts = NULL;
+            if (batch_id >= 0) {
+                PolyBatch* pb = &batches[batch_id];
+                if (pb->pt_cnt + f->pt_cnt > pb->pt_cap) {
+                    uint32_t new_cap = (pb->pt_cap == 0) ? 65536 : pb->pt_cap * 2;
+                    while (new_cap < pb->pt_cnt + f->pt_cnt) new_cap *= 2;
+                    POINT* tmp = (POINT*)realloc(pb->pts, new_cap * sizeof(POINT));
+                    if (!tmp) continue;
+                    pb->pts = tmp;
+                    pb->pt_cap = new_cap;
+                }
+                if (pb->poly_cnt + 1 > pb->poly_cap) {
+                    uint32_t new_cap = (pb->poly_cap == 0) ? 16384 : pb->poly_cap * 2;
+                    DWORD* tmp = (DWORD*)realloc(pb->counts, new_cap * sizeof(DWORD));
+                    if (!tmp) continue;
+                    pb->counts = tmp;
+                    pb->poly_cap = new_cap;
+                }
+                dst_pts = pb->pts + pb->pt_cnt;
+            } else {
+                if (f->pt_cnt > screen_pts_cap) {
+                    screen_pts_cap = f->pt_cnt + 1024;
+                    POINT* tmp = (POINT*)realloc(screen_pts, screen_pts_cap * sizeof(POINT));
+                    if (!tmp) { screen_pts_cap = 0; screen_pts = NULL; continue; }
+                    screen_pts = tmp;
+                }
+                dst_pts = screen_pts;
+            }
+
+            uint32_t pt_idx = 0;
+            int last_px = -999999, last_py = -999999;
+            int min_px_step = (low_poly_mode || f->is_area) ? 1 : 2;
+            const float* f_pts = points + f->pt_off;
+
+            if (!has_rot) {
+                for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                    double dsx = f_pts[j * 2] * g_Zoom + off_x;
+                    double dsy = f_pts[j * 2 + 1] * neg_zoom + off_y;
+                    if (dsx < -32000.0) dsx = -32000.0; else if (dsx > 32000.0) dsx = 32000.0;
+                    if (dsy < -32000.0) dsy = -32000.0; else if (dsy > 32000.0) dsy = 32000.0;
+                    int sx = (int)dsx, sy = (int)dsy;
+                    if (j == 0 || j == f->pt_cnt - 1 || abs(sx - last_px) >= min_px_step || abs(sy - last_py) >= min_px_step) {
+                        dst_pts[pt_idx].x = sx; dst_pts[pt_idx].y = sy;
+                        pt_idx++; last_px = sx; last_py = sy;
+                    }
+                }
+            } else {
+                for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                    double dx = (f_pts[j * 2] - g_CenterLon) * g_Zoom;
+                    double dy = (g_CenterLat - f_pts[j * 2 + 1]) * g_Zoom;
+                    double dsx = half_cw + dx * cos_r - dy * sin_r;
+                    double dsy = half_ch + dx * sin_r + dy * cos_r;
+                    if (dsx < -32000.0) dsx = -32000.0; else if (dsx > 32000.0) dsx = 32000.0;
+                    if (dsy < -32000.0) dsy = -32000.0; else if (dsy > 32000.0) dsy = 32000.0;
+                    int sx = (int)dsx, sy = (int)dsy;
+                    if (j == 0 || j == f->pt_cnt - 1 || abs(sx - last_px) >= min_px_step || abs(sy - last_py) >= min_px_step) {
+                        dst_pts[pt_idx].x = sx; dst_pts[pt_idx].y = sy;
+                        pt_idx++; last_px = sx; last_py = sy;
+                    }
+                }
+            }
+
+            if (draw_area) {
+                if (pt_idx >= 3) {
+                    HBRUSH targetBrush = (f->fc == CLASS_WATER) ? hBrWater : ((f->fc == CLASS_PARK) ? hBrPark : hBrLand);
+                    if (currentBrush != targetBrush) {
+                        SelectObject(g_hdcCanvas, targetBrush);
+                        currentBrush = targetBrush;
+                    }
+                    Polygon(g_hdcCanvas, dst_pts, pt_idx);
+                }
+            } else {
+                if (batch_id >= 0 && pt_idx >= 2) {
+                    PolyBatch* pb = &batches[batch_id];
+                    pb->counts[pb->poly_cnt++] = pt_idx;
+                    pb->pt_cnt += pt_idx;
+                }
+                if (check_label && pt_idx >= 2 && f->name_off < s_len) {
+                    char clean_txt[64];
+                    if (SanitizeMapLabel(strings + f->name_off, s_len - f->name_off, clean_txt, sizeof(clean_txt)) > 0) {
+                        double max_len = 0.0;
+                        uint32_t best_i = 0;
+                        for (uint32_t j = 0; j < pt_idx - 1; j++) {
+                            double p_dx = dst_pts[j+1].x - dst_pts[j].x;
+                            double p_dy = dst_pts[j+1].y - dst_pts[j].y;
+                            double len = p_dx * p_dx + p_dy * p_dy;
+                            if (len > max_len) { max_len = len; best_i = j; }
+                        }
+                        if (max_len >= 30.0) {
+                            int cx = (dst_pts[best_i].x + dst_pts[best_i+1].x) / 2;
+                            int cy = (dst_pts[best_i].y + dst_pts[best_i+1].y) / 2;
+                            if (cx >= 0 && cx <= w && cy >= 0 && cy <= h) {
+                                if (label_cand_cnt >= label_cand_cap) {
+                                    label_cand_cap = (label_cand_cap == 0) ? 2048 : label_cand_cap * 2;
+                                    LabelCand* tmp = (LabelCand*)realloc(label_cands, label_cand_cap * sizeof(LabelCand));
+                                    if (tmp) label_cands = tmp;
+                                }
+                                if (label_cands && label_cand_cnt < label_cand_cap) {
+                                    LabelCand* lc = &label_cands[label_cand_cnt++];
+                                    strcpy(lc->txt, clean_txt);
+                                    lc->hash = HashLabelStr(lc->txt);
+                                    lc->p1x = dst_pts[best_i].x;
+                                    lc->p1y = dst_pts[best_i].y;
+                                    lc->p2x = dst_pts[best_i+1].x;
+                                    lc->p2y = dst_pts[best_i+1].y;
+                                    lc->is_main = (f->fc == CLASS_HWY_MAIN) ? 1 : 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    SelectObject(g_hdcCanvas, hNullBr);
+    if (batches[0].poly_cnt > 0) {
+        SelectObject(g_hdcCanvas, hPenCoast);
+        PolyPolyline(g_hdcCanvas, batches[0].pts, batches[0].counts, batches[0].poly_cnt);
+    }
+    if (batches[1].poly_cnt > 0) {
+        SelectObject(g_hdcCanvas, hPenMin);
+        PolyPolyline(g_hdcCanvas, batches[1].pts, batches[1].counts, batches[1].poly_cnt);
+    }
+    if (batches[2].poly_cnt > 0) {
+        SelectObject(g_hdcCanvas, hPenMain);
+        PolyPolyline(g_hdcCanvas, batches[2].pts, batches[2].counts, batches[2].poly_cnt);
+    }
+
+    if (want_labels && label_cand_cnt > 0) {
+        static HFONT s_MeasureFont = NULL;
+        static HFONT s_RotFonts[37] = {0};
+        if (!s_MeasureFont) {
+            s_MeasureFont = CreateFontA(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+        }
+
+        static RECT drawn_labels[4000];
+        static uint64_t drawn_hashes[4000];
+        int label_cnt = 0;
+
+        HFONT hOldFont = (HFONT)SelectObject(g_hdcCanvas, s_MeasureFont);
+        SetTextColor(g_hdcCanvas, RGB(40, 40, 40));
+        SetBkMode(g_hdcCanvas, TRANSPARENT);
+        SetTextAlign(g_hdcCanvas, TA_CENTER | TA_BASELINE);
+
+        for (int prio = 1; prio >= 0; prio--) {
+            for (uint32_t i = 0; i < label_cand_cnt && label_cnt < 4000; i++) {
+                LabelCand* lc = &label_cands[i];
+                if ((int)lc->is_main != prio) continue;
+
+                bool already_drawn = false;
+                for (int k = 0; k < label_cnt; k++) {
+                    if (drawn_hashes[k] == lc->hash) { already_drawn = true; break; }
+                }
+                if (already_drawn) continue;
+
+                int len = (int)strlen(lc->txt);
+                SIZE sz;
+                GetTextExtentPoint32A(g_hdcCanvas, lc->txt, len, &sz);
+                int cx = (lc->p1x + lc->p2x) / 2;
+                int cy = (lc->p1y + lc->p2y) / 2;
+                int hw = sz.cx / 2, hh = sz.cy / 2;
+                int pad = 10;
+                RECT tr = { cx - hw - pad, cy - hh - pad, cx + hw + pad, cy + hh + pad };
+
+                bool collision = false;
+                for (int k = 0; k < label_cnt; k++) {
+                    RECT dummy;
+                    if (IntersectRect(&dummy, &tr, &drawn_labels[k])) { collision = true; break; }
+                }
+                if (collision) continue;
+
+                double angle_deg = atan2(lc->p1y - lc->p2y, lc->p2x - lc->p1x) * 180.0 / 3.1415926535;
+                while (angle_deg > 90.0) angle_deg -= 180.0;
+                while (angle_deg < -90.0) angle_deg += 180.0;
+
+                int bucket = (int)((angle_deg + 92.5) / 5.0);
+                if (bucket < 0) bucket = 0;
+                else if (bucket > 36) bucket = 36;
+
+                if (!s_RotFonts[bucket]) {
+                    int esc = (bucket * 5 - 90) * 10;
+                    if (esc < 0) esc += 3600;
+                    s_RotFonts[bucket] = CreateFontA(16, 0, esc, esc, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+                }
+
+                SelectObject(g_hdcCanvas, s_RotFonts[bucket]);
+                TextOutA(g_hdcCanvas, cx, cy + (sz.cy / 3), lc->txt, len);
+                SelectObject(g_hdcCanvas, s_MeasureFont);
+
+                drawn_labels[label_cnt] = tr;
+                drawn_hashes[label_cnt] = lc->hash;
+                label_cnt++;
+            }
+        }
+        SelectObject(g_hdcCanvas, hOldFont);
+    }
+
+    LeaveCriticalSection(&g_FileCS);
+
+    if (hClipRgn) {
+        SelectClipRgn(g_hdcCanvas, NULL);
+        DeleteObject(hClipRgn);
+    }
+
+    SelectObject(g_hdcCanvas, hNullPen);
+    SelectObject(g_hdcCanvas, hNullBr);
+    DeleteObject(hBrWater);
+    DeleteObject(hBrLand);
+    DeleteObject(hBrPark);
+    DeleteObject(hPenMain);
+    DeleteObject(hPenMin);
+    DeleteObject(hPenCoast);
+}
+
 static uint8_t* GetChunkData(int c_idx) {
     if (c_idx < 0 || (uint32_t)c_idx >= g_ChunkCount) return NULL;
     EnterCriticalSection(&g_FileCS);
@@ -532,36 +986,75 @@ static uint8_t* GetChunkData(int c_idx) {
         LeaveCriticalSection(&g_FileCS);
         return ret;
     }
+
+    static int16_t* s_ChunkToLRU = NULL;
+    static uint32_t s_ChunkToLRUCap = 0;
+    if (g_ChunkCount > s_ChunkToLRUCap) {
+        uint32_t new_cap = g_ChunkCount + 4096;
+        int16_t* tmp = (int16_t*)realloc(s_ChunkToLRU, new_cap * sizeof(int16_t));
+        if (tmp) {
+            for (uint32_t i = s_ChunkToLRUCap; i < new_cap; i++) tmp[i] = -1;
+            s_ChunkToLRU = tmp;
+            s_ChunkToLRUCap = new_cap;
+            for (int i = 0; i < LRU_SIZE; i++) {
+                int cid = g_LRU[i].chunk_idx;
+                if (cid >= 0 && (uint32_t)cid < s_ChunkToLRUCap) s_ChunkToLRU[cid] = (int16_t)i;
+            }
+        }
+    }
+
     g_FrameCounter++;
-    for (int i = 0; i < LRU_SIZE; i++) {
-        if (g_LRU[i].chunk_idx == c_idx) {
-            g_LRU[i].last_accessed = g_FrameCounter; 
-            uint8_t* ret = g_LRU[i].blob;
+    if (s_ChunkToLRU) {
+        int slot = s_ChunkToLRU[c_idx];
+        if (slot >= 0 && slot < LRU_SIZE && g_LRU[slot].chunk_idx == c_idx) {
+            g_LRU[slot].last_accessed = g_FrameCounter;
+            uint8_t* ret = g_LRU[slot].blob;
             LeaveCriticalSection(&g_FileCS);
             return ret;
         }
+    } else {
+        for (int i = 0; i < LRU_SIZE; i++) {
+            if (g_LRU[i].chunk_idx == c_idx) {
+                g_LRU[i].last_accessed = g_FrameCounter;
+                uint8_t* ret = g_LRU[i].blob;
+                LeaveCriticalSection(&g_FileCS);
+                return ret;
+            }
+        }
     }
-    int evict_i = 0; uint64_t oldest = 0xFFFFFFFFFFFFFFFFULL;
+
+    int evict_i = 0;
+    uint64_t oldest = 0xFFFFFFFFFFFFFFFFULL;
     for (int i = 0; i < LRU_SIZE; i++) {
         if (g_LRU[i].chunk_idx == -1) { evict_i = i; break; }
         if (g_LRU[i].last_accessed < oldest) { oldest = g_LRU[i].last_accessed; evict_i = i; }
     }
-    if (g_LRU[evict_i].chunk_idx != -1) { free(g_LRU[evict_i].blob); g_LRU[evict_i].chunk_idx = -1; }
+    if (g_LRU[evict_i].chunk_idx != -1) {
+        if (s_ChunkToLRU && (uint32_t)g_LRU[evict_i].chunk_idx < s_ChunkToLRUCap) {
+            s_ChunkToLRU[g_LRU[evict_i].chunk_idx] = -1;
+        }
+        free(g_LRU[evict_i].blob);
+        g_LRU[evict_i].chunk_idx = -1;
+    }
 
-    MapChunk* mc = &g_Chunks[c_idx]; 
+    MapChunk* mc = &g_Chunks[c_idx];
     FSEEK64(mc->file, mc->offset, SEEK_SET);
-    
-    uint8_t* comp_buf = malloc(mc->comp_size); 
+
+    uint8_t* comp_buf = malloc(mc->comp_size);
     fread(comp_buf, 1, mc->comp_size, mc->file);
     uint8_t* uncomp_buf = malloc(mc->uncomp_size);
-    
-    lzav_decompress(comp_buf, uncomp_buf, mc->comp_size, mc->uncomp_size); free(comp_buf);
 
-    g_LRU[evict_i].chunk_idx = c_idx; g_LRU[evict_i].blob = uncomp_buf; g_LRU[evict_i].last_accessed = g_FrameCounter;
+    lzav_decompress(comp_buf, uncomp_buf, mc->comp_size, mc->uncomp_size);
+    free(comp_buf);
+
+    g_LRU[evict_i].chunk_idx = c_idx;
+    g_LRU[evict_i].blob = uncomp_buf;
+    g_LRU[evict_i].last_accessed = g_FrameCounter;
+    if (s_ChunkToLRU) s_ChunkToLRU[c_idx] = (int16_t)evict_i;
+
     LeaveCriticalSection(&g_FileCS);
     return uncomp_buf;
 }
-
 static uint8_t* EnsureChunkEditable(int c_idx) {
     if (c_idx < 0 || (uint32_t)c_idx >= g_ChunkCount) return NULL;
     if (g_DirtyBlobs[c_idx]) return g_DirtyBlobs[c_idx];
@@ -691,6 +1184,54 @@ static void DeleteNodeInFeature(int c_idx, int f_idx, int del_node) {
     RecalcFeatureAndChunkBounds(c_idx, f_idx);
 }
 
+static void ScrollAndUpdateCanvas(HWND hwnd, int dx, int dy) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    if (w <= 0 || h <= 0) return;
+
+    if (!g_hdcScreen) {
+        HDC hdc = GetDC(hwnd);
+        g_hdcScreen = CreateCompatibleDC(hdc);
+        ReleaseDC(hwnd, hdc);
+    }
+    if (g_ScreenW != w || g_ScreenH != h) {
+        if (g_hbmScreen) DeleteObject(g_hbmScreen);
+        HDC hdc = GetDC(hwnd);
+        g_hbmScreen = CreateCompatibleBitmap(hdc, w, h);
+        ReleaseDC(hwnd, hdc);
+        SelectObject(g_hdcScreen, g_hbmScreen);
+        g_ScreenW = w; g_ScreenH = h;
+    }
+
+    BitBlt(g_hdcScreen, 0, 0, w, h, g_hdcCanvas, 0, 0, SRCCOPY);
+    BitBlt(g_hdcCanvas, dx, dy, w, h, g_hdcScreen, 0, 0, SRCCOPY);
+
+    RECT r1 = {0}, r2 = {0};
+    bool has_r1 = false, has_r2 = false;
+    int ov = 2;
+
+    if (dx > 0) {
+        r1.left = 0; r1.top = 0;
+        r1.right = (dx + ov < w) ? (dx + ov) : w; r1.bottom = h;
+        has_r1 = true;
+    } else if (dx < 0) {
+        r1.left = (w + dx - ov > 0) ? (w + dx - ov) : 0; r1.top = 0;
+        r1.right = w; r1.bottom = h;
+        has_r1 = true;
+    }
+
+    if (dy > 0) {
+        r2.left = 0; r2.top = 0;
+        r2.right = w; r2.bottom = (dy + ov < h) ? (dy + ov) : h;
+        has_r2 = true;
+    } else if (dy < 0) {
+        r2.left = 0; r2.top = (h + dy - ov > 0) ? (h + dy - ov) : 0;
+        r2.right = w; r2.bottom = h;
+        has_r2 = true;
+    }
+
+    RenderCanvasRegion(hwnd, has_r1 ? &r1 : NULL, has_r2 ? &r2 : NULL, false);
+}
 static void SaveEditedQJM(void) {
     if (!g_EditMode || !g_MapModified || g_ChunkCount == 0 || g_LoadedFileCount == 0) return;
 
@@ -1011,11 +1552,17 @@ static void DrawMap(HDC hdc, int w, int h, double pan_x, double pan_y) {
 }
 
 static void DrawOverlay(HDC hdc, int w, int h) {
-    if (g_HighlightedChunk != -1 && g_HighlightedFeat != -1) {
+    if (g_HighlightedChunk != -1 && g_HighlightedFeat != -1 && (uint32_t)g_HighlightedChunk < g_ChunkCount) {
         uint8_t* data = GetChunkData(g_HighlightedChunk);
         if (data) {
+            uint32_t uncomp_sz = g_Chunks[g_HighlightedChunk].uncomp_size;
             uint32_t f_cnt = *(uint32_t*)data;
             uint32_t p_cnt = *(uint32_t*)(data + 4);
+            uint32_t s_len = *(uint32_t*)(data + 8);
+            uint32_t geom_end = 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float);
+            if (geom_end >= uncomp_sz) s_len = 0;
+            else if (geom_end + s_len > uncomp_sz) s_len = uncomp_sz - geom_end;
+
             if ((uint32_t)g_HighlightedFeat < f_cnt) {
                 PFeat* feats = (PFeat*)(data + 12);
                 float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
@@ -1025,64 +1572,51 @@ static void DrawOverlay(HDC hdc, int w, int h) {
                 HPEN hlPen = CreatePen(PS_SOLID, g_EditMode ? 3 : 6, RGB(255, 50, 50));
                 SelectObject(hdc, GetStockObject(NULL_BRUSH));
                 SelectObject(hdc, hlPen);
-                
-                // Track points and their original indices to ensure selected nodes are mapped correctly
+
                 POINT* poly_pts = malloc((f->pt_cnt + 1) * sizeof(POINT));
                 int* orig_idx = malloc((f->pt_cnt + 1) * sizeof(int));
-                
+
                 uint32_t draw_cnt = 0;
-                int best_seg_draw_idx = 0; 
+                int best_seg_draw_idx = 0;
                 double best_len = -1.0;
 
-                // Inline projection math constants
-                int canvas_w = w * 3, canvas_h = h * 3;
-                double half_cw = canvas_w * 0.5 + g_CanvasPanX;
-                double half_ch = canvas_h * 0.5 + g_CanvasPanY;
+                double half_cw = w * 0.5 + g_PanX;
+                double half_ch = h * 0.5 + g_PanY;
                 double off_x = half_cw - g_CenterLon * g_Zoom;
                 double off_y = half_ch + g_CenterLat * g_Zoom;
-                double dpan_x = g_PanX - g_CanvasPanX;
-                double dpan_y = g_PanY - g_CanvasPanY;
-                int src_x = w - (int)dpan_x;
-                int src_y = h - (int)dpan_y;
-                
+
                 bool has_rot = (fabs(g_Rotation) > 1e-6);
                 double cos_r = has_rot ? cos(g_Rotation) : 1.0;
                 double sin_r = has_rot ? sin(g_Rotation) : 0.0;
-                
+
                 int last_px = -999999, last_py = -999999;
-                
+
                 for (uint32_t j = 0; j < f->pt_cnt; j++) {
                     float lon = points[f->pt_off + j*2];
                     float lat = points[f->pt_off + j*2 + 1];
-                    
-                    double dsx, dsy;
+
+                    double px, py;
                     if (has_rot) {
                         double dx = (lon - g_CenterLon) * g_Zoom;
                         double dy = (g_CenterLat - lat) * g_Zoom;
-                        dsx = half_cw + dx * cos_r - dy * sin_r;
-                        dsy = half_ch + dx * sin_r + dy * cos_r;
+                        px = half_cw + dx * cos_r - dy * sin_r;
+                        py = half_ch + dx * sin_r + dy * cos_r;
                     } else {
-                        dsx = lon * g_Zoom + off_x;
-                        dsy = lat * (-g_Zoom) + off_y;
+                        px = lon * g_Zoom + off_x;
+                        py = lat * (-g_Zoom) + off_y;
                     }
-                    
-                    double px = dsx - src_x;
-                    double py = dsy - src_y;
-                    
+
                     if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
                     if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
-                    
+
                     int sx = (int)px, sy = (int)py;
-                    
-                    // Always record the node if it is currently selected/dragged
                     bool is_sel = (g_EditMode && ((int)j == g_SelectedNode || (int)j == g_SelectedNode2));
-                    
-                    // PIXEL DECIMATION: Skip clustered points mapping to the same pixel coordinate
+
                     if (j == 0 || j == f->pt_cnt - 1 || is_sel || abs(sx - last_px) >= 2 || abs(sy - last_py) >= 2) {
                         poly_pts[draw_cnt].x = sx;
                         poly_pts[draw_cnt].y = sy;
                         orig_idx[draw_cnt] = (int)j;
-                        
+
                         if (draw_cnt > 0) {
                             double dx = poly_pts[draw_cnt].x - poly_pts[draw_cnt-1].x;
                             double dy = poly_pts[draw_cnt].y - poly_pts[draw_cnt-1].y;
@@ -1091,22 +1625,32 @@ static void DrawOverlay(HDC hdc, int w, int h) {
                                 best_len = l; best_seg_draw_idx = draw_cnt - 1;
                             }
                         }
-                        
+
                         draw_cnt++;
                         last_px = sx;
                         last_py = sy;
                     }
                 }
-                
+
                 if (f->is_area && f->pt_cnt >= 3) {
                     poly_pts[draw_cnt] = poly_pts[0];
                     draw_cnt++;
                 }
-                
-                Polyline(hdc, poly_pts, draw_cnt);
+
+                if (draw_cnt >= 2) Polyline(hdc, poly_pts, draw_cnt);
                 DeleteObject(hlPen);
 
-                const char* label = f->name_off ? (strings + f->name_off) : (f->fc == CLASS_HWY_MAIN ? "Main Highway" : (f->fc == CLASS_HWY_MINOR ? "Local Road" : NULL));
+                char clean_label[64] = {0};
+                const char* label = NULL;
+                if (f->name_off > 0 && f->name_off < s_len &&
+                    SanitizeMapLabel(strings + f->name_off, s_len - f->name_off, clean_label, sizeof(clean_label)) > 0) {
+                    label = clean_label;
+                } else if (f->fc == CLASS_HWY_MAIN) {
+                    label = "Main Highway";
+                } else if (f->fc == CLASS_HWY_MINOR) {
+                    label = "Local Road";
+                }
+
                 if (label && label[0] && draw_cnt >= 2) {
                     int p1x = poly_pts[best_seg_draw_idx].x, p1y = poly_pts[best_seg_draw_idx].y;
                     int p2x = poly_pts[best_seg_draw_idx+1].x, p2y = poly_pts[best_seg_draw_idx+1].y;
@@ -1120,9 +1664,10 @@ static void DrawOverlay(HDC hdc, int w, int h) {
                     SetBkMode(hdc, TRANSPARENT);
                     SetTextAlign(hdc, TA_CENTER | TA_BASELINE);
                     SetTextColor(hdc, RGB(255, 255, 255));
-                    for (int ox = -1; ox <= 1; ox++) for (int oy = -1; oy <= 1; oy++) if (ox || oy) TextOutA(hdc, cx + ox, cy - 6 + oy, label, strlen(label));
+                    int lbl_len = (int)strlen(label);
+                    for (int ox = -1; ox <= 1; ox++) for (int oy = -1; oy <= 1; oy++) if (ox || oy) TextOutA(hdc, cx + ox, cy - 6 + oy, label, lbl_len);
                     SetTextColor(hdc, RGB(180, 0, 0));
-                    TextOutA(hdc, cx, cy - 6, label, strlen(label));
+                    TextOutA(hdc, cx, cy - 6, label, lbl_len);
                     SelectObject(hdc, hOldFont);
                     DeleteObject(hFont);
                 }
@@ -1133,13 +1678,12 @@ static void DrawOverlay(HDC hdc, int w, int h) {
                     HBRUSH selBrush = CreateSolidBrush(RGB(255, 220, 0));
                     HBRUSH sel2Brush = CreateSolidBrush(RGB(0, 220, 255));
                     SelectObject(hdc, nPen);
-                    
-                    // Draw boxes only over the decimated points
+
                     for (uint32_t k = 0; k < draw_cnt; k++) {
                         int sx = poly_pts[k].x;
                         int sy = poly_pts[k].y;
                         if (sx < -10 || sx > w + 10 || sy < -10 || sy > h + 10) continue;
-                        
+
                         int orig_j = orig_idx[k];
                         bool is_sel1 = (orig_j == g_SelectedNode);
                         bool is_sel2 = (orig_j == g_SelectedNode2);
@@ -1147,7 +1691,7 @@ static void DrawOverlay(HDC hdc, int w, int h) {
                         int r = (is_sel1 || is_sel2) ? 5 : 4;
                         Rectangle(hdc, sx - r, sy - r, sx + r, sy + r);
                     }
-                    
+
                     DeleteObject(nPen); DeleteObject(nBrush); DeleteObject(selBrush); DeleteObject(sel2Brush);
                 }
                 free(poly_pts);
@@ -1157,15 +1701,25 @@ static void DrawOverlay(HDC hdc, int w, int h) {
     }
 
     if (g_RoutePathCount > 0) {
-        LOGBRUSH lbRoute = { BS_SOLID, c_Route, 0 }; HPEN routePen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, 6, &lbRoute, 0, NULL);
-        SelectObject(hdc, GetStockObject(NULL_BRUSH)); SelectObject(hdc, routePen);
+        LOGBRUSH lbRoute = { BS_SOLID, c_Route, 0 };
+        HPEN routePen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, 6, &lbRoute, 0, NULL);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        SelectObject(hdc, routePen);
         POINT* screen_pts = malloc(g_RoutePathCount * sizeof(POINT));
+        int pt_out = 0, last_rx = -999999, last_ry = -999999;
         for (int i = 0; i < g_RoutePathCount; i++) {
             double px, py; NavLatLonToScreen(g_RoutePath[i].lon, g_RoutePath[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
             if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
             if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
-            screen_pts[i].x = (LONG)px; screen_pts[i].y = (LONG)py;
-        } Polyline(hdc, screen_pts, g_RoutePathCount); free(screen_pts); DeleteObject(routePen);
+            int sx = (int)px, sy = (int)py;
+            if (i == 0 || i == g_RoutePathCount - 1 || abs(sx - last_rx) >= 2 || abs(sy - last_ry) >= 2) {
+                screen_pts[pt_out].x = sx; screen_pts[pt_out].y = sy;
+                pt_out++; last_rx = sx; last_ry = sy;
+            }
+        }
+        if (pt_out >= 2) Polyline(hdc, screen_pts, pt_out);
+        free(screen_pts);
+        DeleteObject(routePen);
     }
 
     HBRUSH brPin = CreateSolidBrush(c_Pin), brPinSel = CreateSolidBrush(c_PinSel);
@@ -1175,18 +1729,23 @@ static void DrawOverlay(HDC hdc, int w, int h) {
         double px, py; NavLatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
         if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
         if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
-        int x = (int)px, y = (int)py; bool selected = false;
-        for(int k=0; k<g_SelectedPinCount; k++) { if(g_SelectedPins[k] == i) selected = true; }
+        int x = (int)px, y = (int)py;
+        bool selected = false;
+        for (int k = 0; k < g_SelectedPinCount; k++) { if (g_SelectedPins[k] == i) selected = true; }
 
-        SelectObject(hdc, selected ? brPinSel : brPin); SelectObject(hdc, selected ? pinSelPen : pinPen);
-        POINT pt[4] = {{x, y}, {x - 10, y - 20}, {x, y - 30}, {x + 10, y - 20}}; Polygon(hdc, pt, 4);
+        SelectObject(hdc, selected ? brPinSel : brPin);
+        SelectObject(hdc, selected ? pinSelPen : pinPen);
+        POINT pt[4] = {{x, y}, {x - 10, y - 20}, {x, y - 30}, {x + 10, y - 20}};
+        Polygon(hdc, pt, 4);
 
         if (i != g_EditingPinIndex && strlen(g_Pins[i].name) > 0) {
             SetTextColor(hdc, RGB(20, 20, 20)); SetBkMode(hdc, TRANSPARENT); SetTextAlign(hdc, TA_CENTER | TA_BOTTOM);
             TextOutA(hdc, x, y - 32, g_Pins[i].name, strlen(g_Pins[i].name));
         }
-    } DeleteObject(brPin); DeleteObject(pinPen); DeleteObject(brPinSel); DeleteObject(pinSelPen);
+    }
+    DeleteObject(brPin); DeleteObject(pinPen); DeleteObject(brPinSel); DeleteObject(pinSelPen);
 }
+
 static void UpdateLegendWindow(HWND hwndMain) {
     if (!hLegend || !hwndMain) return;
     if (g_SelectedPinCount >= 2 && g_RouteStepCount > 0) {
@@ -1866,272 +2425,7 @@ static void PopulateSearchList(HWND hwnd) {
 }
 
 static void UpdateCanvas(HWND hwnd) {
-    RECT rc; GetClientRect(hwnd, &rc);
-    int w = rc.right, h = rc.bottom;
-    if (w <= 0 || h <= 0) return;
-
-    if (fabs(g_PanX) > 0.01 || fabs(g_PanY) > 0.01) {
-        double new_lon, new_lat;
-        NavScreenToLatLon(w / 2, h / 2, w, h, &new_lon, &new_lat);
-        g_CenterLon = new_lon;
-        g_CenterLat = new_lat;
-        g_PanX = 0.0;
-        g_PanY = 0.0;
-    }
-
-    int canvas_w = w * 3, canvas_h = h * 3;
-    if (!g_hdcCanvas) {
-        HDC hdc = GetDC(hwnd);
-        g_hdcCanvas = CreateCompatibleDC(hdc);
-        ReleaseDC(hwnd, hdc);
-    }
-    if (g_CanvasW != canvas_w || g_CanvasH != canvas_h) {
-        if (g_hbmCanvas) DeleteObject(g_hbmCanvas);
-        HDC hdc = GetDC(hwnd);
-        g_hbmCanvas = CreateCompatibleBitmap(hdc, canvas_w, canvas_h);
-        ReleaseDC(hwnd, hdc);
-        SelectObject(g_hdcCanvas, g_hbmCanvas);
-        g_CanvasW = canvas_w; g_CanvasH = canvas_h;
-    }
-
-    g_CanvasPanX = g_PanX; g_CanvasPanY = g_PanY; g_CanvasZoom = g_Zoom; g_CanvasRot = g_Rotation; g_CanvasDirty = false;
-
-    if (g_HighlightedChunk >= 0 && (uint32_t)g_HighlightedChunk < g_ChunkCount && g_HighlightedFeat >= 0) {
-        bool still_vis = false;
-        uint8_t* h_data = GetChunkData(g_HighlightedChunk);
-        if (h_data) {
-            uint32_t f_cnt = *(uint32_t*)h_data;
-            if ((uint32_t)g_HighlightedFeat < f_cnt) {
-                PFeat* hf = &((PFeat*)(h_data + 12))[g_HighlightedFeat];
-                still_vis = IsFeatureVisible((uint32_t)g_HighlightedChunk, hf, g_Zoom);
-            }
-        }
-        if (!still_vis) {
-            g_HighlightedChunk = -1;
-            g_HighlightedFeat = -1;
-            g_SelectedNode = -1;
-            g_SelectedNode2 = -1;
-        }
-    }
-
-    RECT canvas_rc = { 0, 0, canvas_w, canvas_h };
-    HBRUSH bgBrush = CreateSolidBrush(c_Water);
-    FillRect(g_hdcCanvas, &canvas_rc, bgBrush);
-    DeleteObject(bgBrush);
-
-    bool has_rot = (fabs(g_Rotation) > 1e-6);
-    double pad_deg = 8.0 / g_Zoom;
-    double eff_lon = g_CenterLon - g_PanX / g_Zoom;
-    double eff_lat = g_CenterLat + g_PanY / g_Zoom;
-    double vp_min_lon, vp_max_lon, vp_min_lat, vp_max_lat;
-    if (!has_rot) {
-        double half_lon = (canvas_w * 0.5) / g_Zoom + pad_deg;
-        double half_lat = (canvas_h * 0.5) / g_Zoom + pad_deg;
-        vp_min_lon = eff_lon - half_lon; vp_max_lon = eff_lon + half_lon;
-        vp_min_lat = eff_lat - half_lat; vp_max_lat = eff_lat + half_lat;
-    } else {
-        double diag = hypot((double)canvas_w, (double)canvas_h) / (2.0 * g_Zoom) + pad_deg;
-        vp_min_lon = eff_lon - diag; vp_max_lon = eff_lon + diag;
-        vp_min_lat = eff_lat - diag; vp_max_lat = eff_lat + diag;
-    }
-
-    double half_cw = canvas_w * 0.5 + g_PanX;
-    double half_ch = canvas_h * 0.5 + g_PanY;
-    double off_x = half_cw - g_CenterLon * g_Zoom;
-    double off_y = half_ch + g_CenterLat * g_Zoom;
-    double neg_zoom = -g_Zoom;
-    double cos_r = has_rot ? cos(g_Rotation) : 1.0;
-    double sin_r = has_rot ? sin(g_Rotation) : 0.0;
-
-    static POINT* screen_pts = NULL;
-    static uint32_t screen_pts_cap = 0;
-
-    static RECT drawn_labels[4000];
-    static uint64_t drawn_hashes[4000];
-    int label_cnt = 0;
-
-    double main_hwy_min_zoom = g_WorldMapMaxZoom / 3.0;
-    double hwy_zoom_threshold = (g_WorldMapMaxZoom * g_HighwayZoomMult) / 3.0;
-    bool low_poly_mode = (g_Zoom <= g_WorldMapMaxZoom);
-    double min_feat_deg = (g_EditMode ? 0.5 : (low_poly_mode ? 0.75 : 1.5)) / g_Zoom;
-
-    HBRUSH hBrWater = CreateSolidBrush(c_Water);
-    HBRUSH hBrLand  = CreateSolidBrush(c_Land);
-    HBRUSH hBrPark  = CreateSolidBrush(c_Park);
-    HPEN   hPenMain = CreatePen(PS_SOLID, 2, c_HwyMain);
-    HPEN   hPenMin  = CreatePen(PS_SOLID, 1, c_HwyMin);
-    HPEN   hPenCoast = CreatePen(PS_SOLID, 1, c_Coast);
-    HPEN   hNullPen = (HPEN)GetStockObject(NULL_PEN);
-    HBRUSH hNullBr  = (HBRUSH)GetStockObject(NULL_BRUSH);
-
-    EnterCriticalSection(&g_FileCS);
-
-    for (int pass = 1; pass <= 3; pass++) {
-        if (pass == 3 && (!g_ShowLabels || g_Zoom < main_hwy_min_zoom)) continue;
-
-        if (pass == 1) SelectObject(g_hdcCanvas, hNullPen);
-        else if (pass == 2) SelectObject(g_hdcCanvas, hNullBr);
-
-        for (uint32_t c = 0; c < g_ChunkCount; c++) {
-            MapChunk* mc = &g_Chunks[c];
-            bool is_world_chunk = (mc->file == g_WorldMapPtr && g_WorldMapPtr != NULL);
-            bool active_areas = IsChunkActiveForAreas(c, g_Zoom);
-            bool active_roads = IsChunkActiveForRoads(c, g_Zoom);
-
-            if (pass == 1 && !active_areas) continue;
-            if (pass == 2 && !active_areas && !active_roads) continue;
-            if (pass == 3 && !active_roads) continue;
-
-            if (mc->max_lon < vp_min_lon || mc->min_lon > vp_max_lon || mc->max_lat < vp_min_lat || mc->min_lat > vp_max_lat) continue;
-
-            uint8_t* data = GetChunkData(c);
-            if (!data) continue;
-            uint32_t f_cnt = *(uint32_t*)data;
-            uint32_t p_cnt = *(uint32_t*)(data + 4);
-            uint32_t s_len = *(uint32_t*)(data + 8);
-            PFeat* feats = (PFeat*)(data + 12);
-            float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
-            char* strings = (char*)((uint8_t*)points + p_cnt * sizeof(float));
-
-            for (uint32_t i = 0; i < f_cnt; i++) {
-                PFeat* f = &feats[i];
-                if (f->pt_cnt < 2 || f->pt_off + f->pt_cnt * 2 > p_cnt) continue;
-
-                if (is_world_chunk && HasNonWorldChunks() && (f->fc == CLASS_HWY_MINOR || f->fc == CLASS_HWY_MAIN)) continue;
-
-                if (pass == 1) {
-                    if (!f->is_area) continue;
-                    if ((f->fc == CLASS_LAND || f->fc == CLASS_COASTLINE) && !g_ShowLand) continue;
-                    if (f->fc == CLASS_WATER && !g_ShowWater) continue;
-                    if (f->fc == CLASS_PARK && !g_ShowPark) continue;
-                } else if (pass == 2) {
-                    if (f->is_area) continue;
-                    if (f->fc == CLASS_COASTLINE) {
-                        if (!active_areas || !g_ShowCoast) continue;
-                    } else if (f->fc == CLASS_HWY_MAIN) {
-                        if (!active_roads || !g_ShowHwyMain || g_Zoom < main_hwy_min_zoom) continue;
-                    } else if (f->fc == CLASS_HWY_MINOR) {
-                        if (!active_roads || !g_ShowHwyMin || g_Zoom < hwy_zoom_threshold) continue;
-                    } else {
-                        continue;
-                    }
-                } else if (pass == 3) {
-                    if (f->is_area || f->name_off == 0 || f->name_off >= s_len) continue;
-                    if (f->fc != CLASS_HWY_MAIN && f->fc != CLASS_HWY_MINOR && f->fc != CLASS_PLACE && f->fc != CLASS_POI) continue;
-                    if (f->fc == CLASS_HWY_MINOR && g_Zoom < 5000.0) continue;
-                }
-
-                if (f->max_lon < vp_min_lon || f->min_lon > vp_max_lon || f->max_lat < vp_min_lat || f->min_lat > vp_max_lat) continue;
-                if ((f->max_lon - f->min_lon) < min_feat_deg && (f->max_lat - f->min_lat) < min_feat_deg) continue;
-
-                if (f->pt_cnt > screen_pts_cap) {
-                    screen_pts_cap = f->pt_cnt + 1024;
-                    POINT* tmp = (POINT*)realloc(screen_pts, screen_pts_cap * sizeof(POINT));
-                    if (!tmp) { screen_pts_cap = 0; screen_pts = NULL; continue; }
-                    screen_pts = tmp;
-                }
-
-                uint32_t pt_idx = 0;
-                int last_px = -999999, last_py = -999999;
-                int min_px_step = (low_poly_mode || f->is_area) ? 1 : 2;
-                const float* f_pts = points + f->pt_off;
-
-                if (!has_rot) {
-                    for (uint32_t j = 0; j < f->pt_cnt; j++) {
-                        double dsx = f_pts[j * 2] * g_Zoom + off_x;
-                        double dsy = f_pts[j * 2 + 1] * neg_zoom + off_y;
-                        if (dsx < -32000.0) dsx = -32000.0; else if (dsx > 32000.0) dsx = 32000.0;
-                        if (dsy < -32000.0) dsy = -32000.0; else if (dsy > 32000.0) dsy = 32000.0;
-                        int sx = (int)dsx, sy = (int)dsy;
-                        if (j == 0 || j == f->pt_cnt - 1 || abs(sx - last_px) >= min_px_step || abs(sy - last_py) >= min_px_step) {
-                            screen_pts[pt_idx].x = sx; screen_pts[pt_idx].y = sy;
-                            pt_idx++; last_px = sx; last_py = sy;
-                        }
-                    }
-                } else {
-                    for (uint32_t j = 0; j < f->pt_cnt; j++) {
-                        double dx = (f_pts[j * 2] - g_CenterLon) * g_Zoom;
-                        double dy = (g_CenterLat - f_pts[j * 2 + 1]) * g_Zoom;
-                        double dsx = half_cw + dx * cos_r - dy * sin_r;
-                        double dsy = half_ch + dx * sin_r + dy * cos_r;
-                        if (dsx < -32000.0) dsx = -32000.0; else if (dsx > 32000.0) dsx = 32000.0;
-                        if (dsy < -32000.0) dsy = -32000.0; else if (dsy > 32000.0) dsy = 32000.0;
-                        int sx = (int)dsx, sy = (int)dsy;
-                        if (j == 0 || j == f->pt_cnt - 1 || abs(sx - last_px) >= min_px_step || abs(sy - last_py) >= min_px_step) {
-                            screen_pts[pt_idx].x = sx; screen_pts[pt_idx].y = sy;
-                            pt_idx++; last_px = sx; last_py = sy;
-                        }
-                    }
-                }
-
-                if (f->is_area ? (pt_idx < 3) : (pt_idx < 2)) continue;
-
-                if (pass == 1) {
-                    if (f->fc == CLASS_WATER) SelectObject(g_hdcCanvas, hBrWater);
-                    else if (f->fc == CLASS_PARK) SelectObject(g_hdcCanvas, hBrPark);
-                    else SelectObject(g_hdcCanvas, hBrLand);
-                    Polygon(g_hdcCanvas, screen_pts, pt_idx);
-                } else if (pass == 2) {
-                    if (f->fc == CLASS_HWY_MAIN) SelectObject(g_hdcCanvas, hPenMain);
-                    else if (f->fc == CLASS_HWY_MINOR) SelectObject(g_hdcCanvas, hPenMin);
-                    else SelectObject(g_hdcCanvas, hPenCoast);
-                    Polyline(g_hdcCanvas, screen_pts, pt_idx);
-                } else if (pass == 3) {
-                    char* txt = strings + f->name_off;
-                    if (!txt[0]) continue;
-                    uint64_t h_val = HashLabelStr(txt);
-
-                    bool already_drawn = false;
-                    for (int k = 0; k < label_cnt; k++) {
-                        if (drawn_hashes[k] == h_val) { already_drawn = true; break; }
-                    }
-                    if (already_drawn) continue;
-
-                    double max_len = 0; int best_i = 0;
-                    for (uint32_t j = 0; j < pt_idx - 1; j++) {
-                        double p_dx = screen_pts[j+1].x - screen_pts[j].x, p_dy = screen_pts[j+1].y - screen_pts[j].y, len = p_dx*p_dx + p_dy*p_dy;
-                        if (len > max_len) { max_len = len; best_i = (int)j; }
-                    }
-                    if (max_len < 30) continue;
-                    int p1x = screen_pts[best_i].x, p1y = screen_pts[best_i].y, p2x = screen_pts[best_i+1].x, p2y = screen_pts[best_i+1].y;
-                    double angle_rad = atan2(p1y - p2y, p2x - p1x), angle_deg = angle_rad * 180.0 / 3.1415926535;
-                    if (angle_deg < 0) angle_deg += 360.0; if (angle_deg > 90.0 && angle_deg < 270.0) angle_deg -= 180.0;
-                    int cx = (p1x + p2x) / 2, cy = (p1y + p2y) / 2;
-
-                    HFONT hFont = CreateFont(16, 0, (int)(angle_deg * 10), (int)(angle_deg * 10), FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
-                    HFONT hOldFont = (HFONT)SelectObject(g_hdcCanvas, hFont); SIZE sz;
-                    GetTextExtentPoint32A(g_hdcCanvas, txt, (int)strlen(txt), &sz); int hw = sz.cx / 2, hh = sz.cy / 2;
-                    int pad = 10;
-                    RECT tr = { cx - hw - pad, cy - hh - pad, cx + hw + pad, cy + hh + pad };
-
-                    bool collision = false;
-                    for (int k = 0; k < label_cnt; k++) {
-                        RECT dummy;
-                        if (IntersectRect(&dummy, &tr, &drawn_labels[k])) { collision = true; break; }
-                    }
-
-                    if (!collision && label_cnt < 4000) {
-                        drawn_labels[label_cnt] = tr;
-                        drawn_hashes[label_cnt] = h_val;
-                        label_cnt++;
-                        SetTextColor(g_hdcCanvas, RGB(40, 40, 40)); SetBkMode(g_hdcCanvas, TRANSPARENT); SetTextAlign(g_hdcCanvas, TA_CENTER | TA_BASELINE);
-                        TextOutA(g_hdcCanvas, cx, cy + (sz.cy/3), txt, (int)strlen(txt));
-                    }
-                    SelectObject(g_hdcCanvas, hOldFont); DeleteObject(hFont);
-                }
-            }
-        }
-    }
-    LeaveCriticalSection(&g_FileCS);
-
-    SelectObject(g_hdcCanvas, hNullPen);
-    SelectObject(g_hdcCanvas, hNullBr);
-    DeleteObject(hBrWater);
-    DeleteObject(hBrLand);
-    DeleteObject(hBrPark);
-    DeleteObject(hPenMain);
-    DeleteObject(hPenMin);
-    DeleteObject(hPenCoast);
+    RenderCanvasRegion(hwnd, NULL, NULL, !g_InteractiveCanvas);
 }
 
 static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2283,6 +2577,13 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (wParam == 1) {
                 KillTimer(hwnd, 1);
                 PopulateSearchList(hwnd);
+            } else if (wParam == 2) {
+                KillTimer(hwnd, 2);
+                if (g_InteractiveCanvas) {
+                    g_InteractiveCanvas = false;
+                    g_CanvasDirty = true;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
             }
             return 0;
         }
@@ -2615,8 +2916,11 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             g_PanX = 0.0;
             g_PanY = 0.0;
 
+            g_InteractiveCanvas = true;
+            SetTimer(hwnd, 2, 140, NULL);
             g_CanvasDirty = true;
             InvalidateRect(hwnd, NULL, FALSE);
+            UpdateWindow(hwnd);
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -2823,16 +3127,27 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (abs(mx - g_LastMousePos.x) > 3 || abs(my - g_LastMousePos.y) > 3) g_MouseMoved = true;
                 if (g_MouseMoved) {
                     int dx = mx - g_LastMousePos.x, dy = my - g_LastMousePos.y;
+                    if (dx == 0 && dy == 0) return 0;
                     if (wParam & MK_SHIFT) {
                         g_Rotation += dx * 0.008;
+                        g_InteractiveCanvas = true;
+                        SetTimer(hwnd, 2, 120, NULL);
                         g_CanvasDirty = true;
                     } else {
-                        g_PanX += dx; 
+                        g_PanX += dx;
                         g_PanY += dy;
+                        g_InteractiveCanvas = true;
+                        SetTimer(hwnd, 2, 120, NULL);
                     }
-                    g_LastMousePos.x = mx; 
+                    g_LastMousePos.x = mx;
                     g_LastMousePos.y = my;
                     InvalidateRect(hwnd, NULL, FALSE);
+                    static DWORD s_LastPaint = 0;
+                    DWORD now = GetTickCount();
+                    if (now - s_LastPaint >= 14) {
+                        s_LastPaint = now;
+                        UpdateWindow(hwnd);
+                    }
                 }
             }
             return 0;
@@ -3045,17 +3360,6 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     FillRect(hdc, &rc, bgOceanBrush);
                     DeleteObject(bgOceanBrush);
                 } else {
-                    double dpan_x = g_PanX - g_CanvasPanX;
-                    double dpan_y = g_PanY - g_CanvasPanY;
-                    if (g_CanvasW != w * 3 || g_CanvasH != h * 3 || g_Zoom != g_CanvasZoom || g_Rotation != g_CanvasRot || g_CanvasDirty ||
-                        fabs(dpan_x) > w * 0.5 || fabs(dpan_y) > h * 0.5) {
-                        UpdateCanvas(hwnd);
-                        dpan_x = g_PanX - g_CanvasPanX;
-                        dpan_y = g_PanY - g_CanvasPanY;
-                    }
-                    int src_x = w - (int)dpan_x;
-                    int src_y = h - (int)dpan_y;
-
                     if (!g_hdcScreen) g_hdcScreen = CreateCompatibleDC(hdc);
                     if (g_ScreenW != w || g_ScreenH != h) {
                         if (g_hbmScreen) DeleteObject(g_hbmScreen);
@@ -3064,7 +3368,17 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         g_ScreenW = w; g_ScreenH = h;
                     }
 
-                    BitBlt(g_hdcScreen, 0, 0, w, h, g_hdcCanvas, src_x, src_y, SRCCOPY);
+                    int dx = (int)(g_PanX - g_CanvasPanX);
+                    int dy = (int)(g_PanY - g_CanvasPanY);
+
+                    if (g_CanvasW != w || g_CanvasH != h || g_Zoom != g_CanvasZoom || g_Rotation != g_CanvasRot || g_CanvasDirty ||
+                        abs(dx) >= w - 4 || abs(dy) >= h - 4) {
+                        UpdateCanvas(hwnd);
+                    } else if (dx != 0 || dy != 0) {
+                        ScrollAndUpdateCanvas(hwnd, dx, dy);
+                    }
+
+                    BitBlt(g_hdcScreen, 0, 0, w, h, g_hdcCanvas, 0, 0, SRCCOPY);
                     EnterCriticalSection(&g_FileCS);
                     DrawOverlay(g_hdcScreen, w, h);
                     LeaveCriticalSection(&g_FileCS);
@@ -3073,7 +3387,7 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         SetBkMode(g_hdcScreen, TRANSPARENT);
                         SetTextColor(g_hdcScreen, RGB(0, 50, 150));
                         SetTextAlign(g_hdcScreen, TA_CENTER | TA_BASELINE);
-                        
+
                         HFONT hFont = CreateFont(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
                         HFONT hOldFont = (HFONT)SelectObject(g_hdcScreen, hFont);
                         const char* prompt = "Drag QJM map here to load.";
