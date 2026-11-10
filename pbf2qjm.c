@@ -36,6 +36,12 @@ typedef struct {
     double min_lon, max_lon, min_lat, max_lat;
 } PolyAABB;
 
+typedef struct {
+    char pcode[16];
+    double lat;
+    double lon;
+} CsvPcode;
+
 static RefPoly* g_RefPolys = NULL;
 static uint32_t g_RefPolyCount = 0;
 
@@ -46,18 +52,24 @@ static HWND g_hCompilerWnd = NULL;
 static HWND hTxtIn, hTxtRef, hTxtShp, hTxtOut, hBtnIn, hBtnRef, hBtnShp, hBtnOut, hBtnRun, hBtnDelTmp, hLblStatus;
 static HWND hChkPcode, hChkLZAV, hChkLand, hChkCoast, hChkHwyMain, hChkHwyMin, hChkWater, hChkPark, hChkSpecs;
 
-static HWND hTxtSimpLand, hTxtSimpCoast, hTxtSimpHwyMain, hTxtSimpHwyMin, hTxtSimpWater, hTxtSimpPark, hTxtSimpLowPoly;
+static HWND hTxtSimpLand, hTxtSimpCoast, hTxtSimpHwyMain, hTxtSimpHwyMin, hTxtSimpWater, hTxtSimpPark, hTxtCsvFiles, hBtnCsv;
 static HWND hChkNoRoads, hTxtSimpNoRoads;
-static int g_SimpLand = 100, g_SimpCoast = 100, g_SimpHwyMain = 100, g_SimpHwyMin = 100, g_SimpWater = 100, g_SimpPark = 100, g_SimpLowPoly = 75;
+static int g_SimpLand = 100, g_SimpCoast = 100, g_SimpHwyMain = 100, g_SimpHwyMin = 100, g_SimpWater = 100, g_SimpPark = 100, g_SimpLowPoly = 20;
+static char g_CsvFiles[32768] = {0};
 static bool g_CfgNoRoads = true;
 static int g_SimpNoRoads = 100;
 
 static PolyAABB* g_WaterAABBs = NULL;
 
+static HWND hTxtSimpLand, hTxtSimpCoast, hTxtSimpHwyMain, hTxtSimpHwyMin, hTxtSimpWater, hTxtSimpPark, hTxtCsvFiles, hBtnCsv;
 // Forward declaration to satisfy the compiler
 static LRESULT CALLBACK CompilerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void ProjectToBBox(double lon, double lat, double min_x, double max_x, double min_y, double max_y, WayNode* out_node);
+static int CompareCsvPcode(const void* a, const void* b) {
+    return strcmp(((CsvPcode*)a)->pcode, ((CsvPcode*)b)->pcode);
+}
+
 static void DeletePassTempFiles(const char* pass_out_filename, bool keep_nodes) {
     if (!pass_out_filename || !*pass_out_filename) return;
     const char* suffixes[] = {
@@ -249,6 +261,177 @@ static void SetStatus(const char* fmt, ...) {
     va_end(args);
     if (hLblStatus) SetWindowTextA(hLblStatus, buf);
     if (g_hCompilerWnd) SetWindowTextA(g_hCompilerWnd, buf);
+}
+
+static void ProcessPostalCodeCSVs(const char* file_list, const char* raw_tmp_name, SortEntry** entries, uint64_t* cnt, uint32_t* cap, bool has_bbox, double b_minLon, double b_minLat, double b_maxLon, double b_maxLat) {
+    char list_copy[32768];
+    strncpy(list_copy, file_list, sizeof(list_copy)-1);
+    list_copy[sizeof(list_copy)-1] = '\0';
+    
+    uint32_t csv_cap = 65536;
+    uint32_t csv_cnt = 0;
+    CsvPcode* csv_arr = malloc(csv_cap * sizeof(CsvPcode));
+    if (!csv_arr) return;
+
+    char* file_path = strtok(list_copy, ";");
+    while (file_path) {
+        while (*file_path == ' ') file_path++;
+        FILE* f = fopen(file_path, "r");
+        if (f) {
+            SetStatus("Processing Postal Codes from: %s", file_path);
+            char line[2048];
+            bool is_first = true;
+            int col_pcode = -1, col_lat = -1, col_lon = -1;
+            
+            while (fgets(line, sizeof(line), f)) {
+                char* p = line;
+                while (*p) { if (*p == '\r' || *p == '\n') *p = '\0'; p++; }
+                if (strlen(line) == 0) continue;
+                
+                char* cols[64]; int num_cols = 0;
+                char sep = strchr(line, '\t') ? '\t' : ','; 
+                char* token = line;
+                while (token && num_cols < 64) {
+                    char* next = strchr(token, sep);
+                    if (next) { *next = '\0'; cols[num_cols++] = token; token = next + 1; }
+                    else { cols[num_cols++] = token; break; }
+                }
+                
+                if (is_first) {
+                    is_first = false;
+                    bool has_header = false;
+                    for (int c = 0; c < num_cols; c++) {
+                        if (FindSubStringIC(cols[c], "PostalCode") || FindSubStringIC(cols[c], "Latitude") || FindSubStringIC(cols[c], "FSA") || FindSubStringIC(cols[c], "Place Name") || FindSubStringIC(cols[c], "FSA1") || FindSubStringIC(cols[c], "FSA-Province") || FindSubStringIC(cols[c], "AreaType")) {
+                            has_header = true; break;
+                        }
+                    }
+                    if (has_header) {
+                        for (int c = 0; c < num_cols; c++) {
+                            if (FindSubStringIC(cols[c], "PostalCode") || FindSubStringIC(cols[c], "FSA") || FindSubStringIC(cols[c], "FSA1")) { if (col_pcode == -1) col_pcode = c; }
+                            else if (FindSubStringIC(cols[c], "Latitude")) col_lat = c;
+                            else if (FindSubStringIC(cols[c], "Longitude")) col_lon = c;
+                        }
+                        continue;
+                    } else {
+                        if (num_cols >= 9 && strchr(cols[7], '.') && strchr(cols[8], '.')) {
+                            col_pcode = 1; col_lat = 7; col_lon = 8;
+                        } else if (num_cols >= 4 && strchr(cols[2], '.') && strchr(cols[3], '.')) {
+                            col_pcode = 0; col_lat = 2; col_lon = 3;
+                        } else {
+                            for(int c=0; c<num_cols; c++) {
+                                if (strchr(cols[c], '.')) {
+                                    if (col_lat == -1) col_lat = c;
+                                    else if (col_lon == -1) col_lon = c;
+                                }
+                            }
+                            if (col_pcode == -1) col_pcode = 0;
+                        }
+                    }
+                }
+                
+                if (col_pcode >= 0 && col_lat >= 0 && col_lon >= 0 && col_pcode < num_cols && col_lat < num_cols && col_lon < num_cols) {
+                    double lat = atof(cols[col_lat]);
+                    double lon = atof(cols[col_lon]);
+                    if (has_bbox && (lon < b_minLon || lon > b_maxLon || lat < b_minLat || lat > b_maxLat)) continue;
+                    
+                    char* pcode = cols[col_pcode];
+                    if (!pcode || strlen(pcode) == 0) continue;
+
+                    if (csv_cnt >= csv_cap) {
+                        csv_cap *= 2;
+                        CsvPcode* safe = realloc(csv_arr, csv_cap * sizeof(CsvPcode));
+                        if (!safe) break;
+                        csv_arr = safe;
+                    }
+                    
+                    strncpy(csv_arr[csv_cnt].pcode, pcode, 15);
+                    csv_arr[csv_cnt].pcode[15] = '\0';
+                    csv_arr[csv_cnt].lat = lat;
+                    csv_arr[csv_cnt].lon = lon;
+                    csv_cnt++;
+                }
+            }
+            fclose(f);
+        }
+        file_path = strtok(NULL, ";");
+    }
+
+    if (csv_cnt == 0) {
+        free(csv_arr);
+        return;
+    }
+
+    SetStatus("Sorting and deduplicating %u CSV postal codes...", csv_cnt);
+    qsort(csv_arr, csv_cnt, sizeof(CsvPcode), CompareCsvPcode);
+    
+    uint32_t unique_cnt = 0;
+    for (uint32_t i = 0; i < csv_cnt; i++) {
+        if (i > 0 && strcmp(csv_arr[i].pcode, csv_arr[unique_cnt - 1].pcode) == 0) continue;
+        csv_arr[unique_cnt++] = csv_arr[i];
+    }
+    csv_cnt = unique_cnt;
+
+    SetStatus("Stripping overridden postal codes from PBF data...");
+    FILE* f_mod = fopen(raw_tmp_name, "r+b");
+    if (f_mod) {
+        for (uint64_t i = 0; i < *cnt; i++) {
+            uint64_t offset = (*entries)[i].offset;
+            FSEEK64(f_mod, offset, SEEK_SET);
+            
+            uint32_t total_len;
+            if (fread(&total_len, 4, 1, f_mod) != 1) continue;
+            
+            uint8_t fc, area;
+            fread(&fc, 1, 1, f_mod);
+            fread(&area, 1, 1, f_mod);
+            
+            uint16_t nlen;
+            fread(&nlen, 2, 1, f_mod);
+            if (nlen > 0) FSEEK64(f_mod, nlen, SEEK_CUR);
+            
+            uint16_t plen;
+            fread(&plen, 2, 1, f_mod);
+            
+            if (plen > 0 && plen < 16) {
+                uint64_t pcode_pos = FTELL64(f_mod);
+                char pcode[16] = {0};
+                fread(pcode, 1, plen, f_mod);
+                pcode[plen] = '\0';
+                
+                int l = 0, r = csv_cnt - 1;
+                bool is_dup = false;
+                while (l <= r) {
+                    int m = l + (r - l) / 2;
+                    int cmp = strcmp(csv_arr[m].pcode, pcode);
+                    if (cmp == 0) { is_dup = true; break; }
+                    if (cmp < 0) l = m + 1;
+                    else r = m - 1;
+                }
+                
+                if (is_dup) {
+                    FSEEK64(f_mod, pcode_pos, SEEK_SET);
+                    char zeros[16] = {0};
+                    fwrite(zeros, 1, plen, f_mod);
+                }
+            }
+        }
+        fclose(f_mod);
+    }
+
+    SetStatus("Appending %u unified CSV postal codes...", csv_cnt);
+    FILE* f_app = fopen(raw_tmp_name, "ab");
+    if (f_app) {
+        for (uint32_t i = 0; i < csv_cnt; i++) {
+            WayNode wn;
+            wn.id = 1;
+            wn.lat = csv_arr[i].lat;
+            wn.lon = csv_arr[i].lon;
+            WriteRawFeature(f_app, &wn, 1, false, NULL, csv_arr[i].pcode, CLASS_PLACE, entries, cnt, cap);
+        }
+        fclose(f_app);
+    }
+    
+    free(csv_arr);
 }
 
 static WayNode* ClipPolygonAABB(WayNode* in_nodes, uint32_t in_cnt, double min_x, double min_y, double max_x, double max_y, uint32_t* out_cnt, PolyAABB* out_box) {
@@ -984,7 +1167,8 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             double best_tail_d = 1e-6;
             uint32_t best_tail_j = (uint32_t)-1;
             for (uint32_t j = 0; j < coast_cnt; j++) {
-                if (i == j || coasts[j].merged || coasts[j].count < 2) continue;
+                // Must be the same feature class to merge (prevents lakes merging into coastlines)
+                if (i == j || coasts[j].merged || coasts[j].count < 2 || coasts[i].fc != coasts[j].fc) continue;
                 WayNode jS = coasts[j].nodes[0];
                 double d = (jS.lon - tail_pt.lon) * (jS.lon - tail_pt.lon) + (jS.lat - tail_pt.lat) * (jS.lat - tail_pt.lat);
                 if (d < best_tail_d) {
@@ -1021,7 +1205,7 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             double best_head_d = 1e-6;
             uint32_t best_head_j = (uint32_t)-1;
             for (uint32_t j = 0; j < coast_cnt; j++) {
-                if (i == j || coasts[j].merged || coasts[j].count < 2) continue;
+                if (i == j || coasts[j].merged || coasts[j].count < 2 || coasts[i].fc != coasts[j].fc) continue;
                 WayNode jE = coasts[j].nodes[coasts[j].count - 1];
                 double d = (jE.lon - head_pt.lon) * (jE.lon - head_pt.lon) + (jE.lat - head_pt.lat) * (jE.lat - head_pt.lat);
                 if (d < best_head_d) {
@@ -1052,7 +1236,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
     }
 
-    // Bridge clipped river estuaries (up to 0.15 deg) as long as the bridge midpoint doesn't cut across open ocean
     bool bridged = true;
     while (bridged) {
         bridged = false;
@@ -1065,20 +1248,28 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             double best_d = 0.15 * 0.15;
 
             for (uint32_t j = 0; j < coast_cnt; j++) {
-                if (i == j || coasts[j].merged || coasts[j].count < 2) continue;
+                if (i == j || coasts[j].merged || coasts[j].count < 2 || coasts[i].fc != coasts[j].fc) continue;
                 WayNode jS = coasts[j].nodes[0], jE = coasts[j].nodes[coasts[j].count - 1];
                 if ((jS.lon - jE.lon) * (jS.lon - jE.lon) + (jS.lat - jE.lat) * (jS.lat - jE.lat) < 1e-8) continue;
 
                 double d = (iE.lon - jS.lon) * (iE.lon - jS.lon) + (iE.lat - jS.lat) * (iE.lat - jS.lat);
                 if (d < best_d) {
                     WayNode link[2] = { iE, jS };
+                    double l_min_x = fmin(iE.lon, jS.lon), l_max_x = fmax(iE.lon, jS.lon);
+                    double l_min_y = fmin(iE.lat, jS.lat), l_max_y = fmax(iE.lat, jS.lat);
                     bool crosses = false;
                     for (uint32_t k = 0; k + 2 < coasts[i].count; k++) {
-                        if (BowtieSegmentsIntersect(link[0], link[1], coasts[i].nodes[k], coasts[i].nodes[k + 1])) { crosses = true; break; }
+                        WayNode a = coasts[i].nodes[k], b = coasts[i].nodes[k + 1];
+                        if (fmax(a.lon, b.lon) < l_min_x || fmin(a.lon, b.lon) > l_max_x ||
+                            fmax(a.lat, b.lat) < l_min_y || fmin(a.lat, b.lat) > l_max_y) continue;
+                        if (BowtieSegmentsIntersect(link[0], link[1], a, b)) { crosses = true; break; }
                     }
                     if (!crosses) {
                         for (uint32_t k = 1; k + 1 < coasts[j].count; k++) {
-                            if (BowtieSegmentsIntersect(link[0], link[1], coasts[j].nodes[k], coasts[j].nodes[k + 1])) { crosses = true; break; }
+                            WayNode a = coasts[j].nodes[k], b = coasts[j].nodes[k + 1];
+                            if (fmax(a.lon, b.lon) < l_min_x || fmin(a.lon, b.lon) > l_max_x ||
+                                fmax(a.lat, b.lat) < l_min_y || fmin(a.lat, b.lat) > l_max_y) continue;
+                            if (BowtieSegmentsIntersect(link[0], link[1], a, b)) { crosses = true; break; }
                         }
                     }
                     if (!crosses) {
@@ -1106,7 +1297,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
     }
 
-    // Chain major open coastlines around the BBox perimeter into a single landmass polygon
     uint32_t major_idx[256];
     uint32_t major_cnt = 0;
     double W = max_x - min_x, H = max_y - min_y, perimeter = 2.0 * W + 2.0 * H;
@@ -1114,7 +1304,8 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
     double corners_p[4] = { 0.0, W, W + H, 2.0 * W + H };
 
     for (uint32_t i = 0; i < coast_cnt && major_cnt < 256; i++) {
-        if (coasts[i].merged || coasts[i].count < 64) continue;
+        // Restrict global perimeter chaining strictly to coastal landmasses
+        if (coasts[i].merged || coasts[i].count < 64 || coasts[i].fc != CLASS_COASTLINE) continue;
         WayNode s = coasts[i].nodes[0], e = coasts[i].nodes[coasts[i].count - 1];
         double gap2 = (s.lon - e.lon) * (s.lon - e.lon) + (s.lat - e.lat) * (s.lat - e.lat);
         if (gap2 >= 0.15 * 0.15) {
@@ -1140,8 +1331,7 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
 
         uint32_t total_alloc = 0;
         for (uint32_t m = 0; m < major_cnt; m++) total_alloc += coasts[major_idx[m]].count + 16;
-        
-        // Generate FWD (CCW) Assembly (May enclose Ocean)
+
         WayNode* fwd_nodes = malloc(total_alloc * sizeof(WayNode));
         uint32_t fwd_cnt = 0;
         for (uint32_t m = 0; m < major_cnt; m++) {
@@ -1169,7 +1359,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
         WayNode first_fwd = fwd_nodes[0]; first_fwd.id = 1; fwd_nodes[fwd_cnt++] = first_fwd;
 
-        // Generate REV (CW) Assembly (May enclose Land)
         WayNode* rev_nodes = malloc(total_alloc * sizeof(WayNode));
         uint32_t rev_cnt = 0;
         for (uint32_t i = 0; i < major_cnt; i++) {
@@ -1198,13 +1387,23 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         }
         WayNode first_rev = rev_nodes[0]; first_rev.id = 1; rev_nodes[rev_cnt++] = first_rev;
 
-        // Test which topology actually encloses the roads (Land) vs Ocean
         uint32_t fwd_roads = CountRoadSamplesInside(fwd_nodes, fwd_cnt, road_samples, road_sample_cnt);
         uint32_t rev_roads = CountRoadSamplesInside(rev_nodes, rev_cnt, road_samples, road_sample_cnt);
+        bool fwd_water = IsPolygonMostlyWater(fwd_nodes, fwd_cnt, water_polys, water_poly_cnt);
+        bool rev_water = IsPolygonMostlyWater(rev_nodes, rev_cnt, water_polys, water_poly_cnt);
+
+        bool pick_rev = false;
+        if (fwd_water != rev_water) {
+            pick_rev = fwd_water && !rev_water;
+        } else if (road_sample_cnt > 0 && fwd_roads != rev_roads) {
+            pick_rev = (rev_roads > fwd_roads);
+        } else {
+            pick_rev = (CalculateSignedArea(rev_nodes, rev_cnt) < CalculateSignedArea(fwd_nodes, fwd_cnt));
+        }
 
         WayNode* best_nodes = fwd_nodes;
         uint32_t best_cnt = fwd_cnt;
-        if (rev_roads > fwd_roads) {
+        if (pick_rev) {
             best_nodes = rev_nodes;
             best_cnt = rev_cnt;
             free(fwd_nodes);
@@ -1212,7 +1411,6 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             free(rev_nodes);
         }
 
-        // Finalize merging
         for (uint32_t m = 1; m < major_cnt; m++) {
             AccumWay* cur = &coasts[major_idx[m]];
             cur->merged = true;
@@ -1228,7 +1426,11 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
 
     for (uint32_t i = 0; i < coast_cnt; i++) {
         if (coasts[i].merged || coasts[i].count < 2) continue;
-        CloseSingleCoastlineNoBowtie(&coasts[i], water_polys, water_poly_cnt, road_samples, road_sample_cnt, min_x, max_x, min_y, max_y);
+        
+        // ONLY box-close land and coastlines. Leave water and parks alone.
+        if (coasts[i].fc == CLASS_COASTLINE || coasts[i].fc == CLASS_LAND) {
+            CloseSingleCoastlineNoBowtie(&coasts[i], water_polys, water_poly_cnt, road_samples, road_sample_cnt, min_x, max_x, min_y, max_y);
+        }
     }
 }
 static void LoadConfig() {
@@ -1460,7 +1662,6 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         bool resumed = false;
         uint32_t EOF_MARKER = 0xDEADBEEF;
 
-        // Robust resume check
         f_raw = fopen(raw_tmp_name, "rb");
         if (f_raw) {
             FSEEK64(f_raw, 0, SEEK_END); int64_t raw_sz = FTELL64(f_raw);
@@ -1658,6 +1859,15 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     return 1;
                 }
                 ProcessShapefile(in_filename, f_raw, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
+                
+                if (!two_pass_mode || qjm_pass == 2) {
+                    if (g_CsvFiles[0] != '\0') {
+                        fclose(f_raw);
+                        ProcessPostalCodeCSVs(g_CsvFiles, raw_tmp_name, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
+                        f_raw = fopen(raw_tmp_name, "ab");
+                    }
+                }
+                
                 fwrite(&EOF_MARKER, 4, 1, f_raw);
                 fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
             } else {
@@ -1776,7 +1986,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         }
                         char* io_node_buf = malloc(IO_BUF_SIZE); if (io_node_buf) setvbuf(fnodes, io_node_buf, _IOFBF, IO_BUF_SIZE);
 
-                        const uint64_t CHUNK_NODES = 5000000;
+                        const uint64_t CHUNK_NODES = 15000000;
                         PbfNode* chunk = malloc(CHUNK_NODES * sizeof(PbfNode));
                         if (!chunk) {
                             fclose(fnodes); if (io_node_buf) free(io_node_buf); free(road_samples); free(sort_entries);
@@ -1903,6 +2113,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (fread(wnodes, sizeof(WayNode), ref_count, fways) != ref_count) { if (name) free(name); if (pcode) free(pcode); free(wnodes); break; }
 
                         bool valid = true;
+                        
                         for (uint32_t i = 0; i < ref_count; i++) { if (wnodes[i].id != 0xFFFFFFFFFFFFFFFFULL) { valid = false; break; } }
 
                         if (valid && ref_count >= 2) {
@@ -1921,7 +2132,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                 }
                             }
 
-                            if (fc == CLASS_COASTLINE) {
+                            if (fc == CLASS_COASTLINE || fc == CLASS_WATER || fc == CLASS_PARK || fc == CLASS_LAND) {
                                 double dx = wnodes[0].lon - wnodes[ref_count - 1].lon;
                                 double dy = wnodes[0].lat - wnodes[ref_count - 1].lat;
                                 bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
@@ -1936,7 +2147,19 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                     bool in_bbox = true;
                                     if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
                                     if (!g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-                                    if (in_bbox) WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, CLASS_LAND, &sort_entries, &written_feats, &feature_capacity);
+
+                                    if (in_bbox) {
+                                        if (has_bbox) {
+                                            uint32_t clipped_cnt = 0;
+                                            WayNode* clipped = ClipPolygonAABB(wnodes, ref_count, b_minLon, b_minLat, b_maxLon, b_maxLat, &clipped_cnt, NULL);
+                                            if (clipped && clipped_cnt >= 4) {
+                                                WriteRawFeature(f_raw, clipped, clipped_cnt, true, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
+                                            }
+                                            if (clipped) free(clipped);
+                                        } else {
+                                            WriteRawFeature(f_raw, wnodes, ref_count, true, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
+                                        }
+                                    }
                                     if (name) free(name); if (pcode) free(pcode); free(wnodes);
                                 } else {
                                     if (coast_cnt >= coast_cap) {
@@ -1945,34 +2168,6 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                                     }
                                     coasts[coast_cnt].name = name; coasts[coast_cnt].pcode = pcode; coasts[coast_cnt].count = ref_count; coasts[coast_cnt].nodes = wnodes; coasts[coast_cnt].merged = false; coasts[coast_cnt].fc = fc; coast_cnt++;
                                 }
-                            } else if (fc == CLASS_WATER || fc == CLASS_PARK || fc == CLASS_LAND) {
-                                double dx = wnodes[0].lon - wnodes[ref_count - 1].lon;
-                                double dy = wnodes[0].lat - wnodes[ref_count - 1].lat;
-                                bool is_closed = (ref_count >= 4) && (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
-                                if (is_closed) wnodes[ref_count - 1] = wnodes[0];
-
-                                double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
-                                for (uint32_t i = 0; i < ref_count; i++) {
-                                    if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon; if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
-                                    if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat; if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
-                                }
-                                bool in_bbox = true;
-                                if (has_bbox && (max_lon < b_minLon || min_lon > b_maxLon || max_lat < b_minLat || min_lat > b_maxLat)) in_bbox = false;
-                                if (is_closed && !g_CfgSpecs && (max_lon - min_lon < 0.005) && (max_lat - min_lat < 0.005)) in_bbox = false;
-
-                                if (in_bbox) {
-                                    if (has_bbox && is_closed) {
-                                        uint32_t clipped_cnt = 0;
-                                        WayNode* clipped = ClipPolygonAABB(wnodes, ref_count, b_minLon, b_minLat, b_maxLon, b_maxLat, &clipped_cnt, NULL);
-                                        if (clipped && clipped_cnt >= 4) {
-                                            WriteRawFeature(f_raw, clipped, clipped_cnt, true, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
-                                        }
-                                        if (clipped) free(clipped);
-                                    } else {
-                                        WriteRawFeature(f_raw, wnodes, ref_count, is_closed, name, pcode, fc, &sort_entries, &written_feats, &feature_capacity);
-                                    }
-                                }
-                                if (name) free(name); if (pcode) free(pcode); free(wnodes);
                             } else {
                                 double min_lon = 180.0, max_lon = -180.0, min_lat = 90.0, max_lat = -90.0;
                                 for (uint32_t i = 0; i < ref_count; i++) {
@@ -2097,8 +2292,22 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             if (coasts[i].nodes) free(coasts[i].nodes);
                             continue;
                         }
+                        
                         uint8_t out_fc = (coasts[i].fc == CLASS_COASTLINE) ? CLASS_LAND : coasts[i].fc;
-                        WriteRawFeature(f_raw, coasts[i].nodes, coasts[i].count, true, coasts[i].name, coasts[i].pcode, out_fc, &sort_entries, &written_feats, &feature_capacity);
+
+                        // Check if the geometry is genuinely closed
+                        double dx = coasts[i].nodes[0].lon - coasts[i].nodes[coasts[i].count - 1].lon;
+                        double dy = coasts[i].nodes[0].lat - coasts[i].nodes[coasts[i].count - 1].lat;
+                        bool is_closed = (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
+
+                        // If it's an unclosed water/park feature (like a river), write it as a line
+                        bool is_area = true;
+                        if ((out_fc == CLASS_WATER || out_fc == CLASS_PARK) && !is_closed) {
+                            is_area = false;
+                        }
+
+                        WriteRawFeature(f_raw, coasts[i].nodes, coasts[i].count, is_area, coasts[i].name, coasts[i].pcode, out_fc, &sort_entries, &written_feats, &feature_capacity);
+                        
                         if (coasts[i].name) free(coasts[i].name);
                         if (coasts[i].pcode) free(coasts[i].pcode);
                         free(coasts[i].nodes);
@@ -2107,6 +2316,14 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (water_polys) { for (uint32_t wp = 0; wp < water_poly_cnt; wp++) free(water_polys[wp].nodes); free(water_polys); }
                     if (g_WaterAABBs) { free(g_WaterAABBs); g_WaterAABBs = NULL; }
                     free(coasts);
+                }
+
+                if (!two_pass_mode || qjm_pass == 2) {
+                    if (g_CsvFiles[0] != '\0') {
+                        fclose(f_raw);
+                        ProcessPostalCodeCSVs(g_CsvFiles, raw_tmp_name, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
+                        f_raw = fopen(raw_tmp_name, "ab");
+                    }
                 }
 
                 // Ensure EOF_MARKER is written so subsequent runs can resume cleanly
@@ -2403,6 +2620,7 @@ return 0;
 
 static BOOL CALLBACK SetFontProc(HWND hwnd, LPARAM lParam) { SendMessageA(hwnd, WM_SETFONT, lParam, TRUE); return TRUE; }
 
+// --- Replace the original CompilerWndProc with this updated version ---
 static LRESULT CALLBACK CompilerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 switch (msg) {
     case WM_CREATE: {
@@ -2449,8 +2667,9 @@ switch (msg) {
         hChkPcode = CreateWindowA("BUTTON", "Postcodes", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 345, 100, 20, hwnd, NULL, NULL, NULL);
         hChkSpecs = CreateWindowA("BUTTON", "Specs", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 345, 80, 20, hwnd, NULL, NULL, NULL);
 
-        CreateWindowA("STATIC", "LOD Ext. Simplification (Keep %):", WS_VISIBLE|WS_CHILD, 240, 345, 210, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpLowPoly = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "75", WS_VISIBLE|WS_CHILD|ES_NUMBER, 460, 345, 30, 20, hwnd, NULL, NULL, NULL);
+        CreateWindowA("STATIC", "Postal Code CSV(s):", WS_VISIBLE|WS_CHILD, 230, 345, 120, 20, hwnd, NULL, NULL, NULL);
+        hTxtCsvFiles = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 350, 345, 130, 20, hwnd, NULL, NULL, NULL);
+        hBtnCsv = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 485, 345, 70, 20, hwnd, (HMENU)7, NULL, NULL);
 
         hChkNoRoads = CreateWindowA("BUTTON", "Land/Coast (No Roads)", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 375, 180, 20, hwnd, NULL, NULL, NULL);
         hTxtSimpNoRoads = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 205, 375, 30, 20, hwnd, NULL, NULL, NULL);
@@ -2488,6 +2707,33 @@ switch (msg) {
             OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
             ofn.lpstrFilter = "Shapefiles (*.shp)\0*.shp\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
             if (GetOpenFileNameA(&ofn)) SetWindowTextA(hTxtShp, path);
+        } else if (LOWORD(wParam) == 7) { 
+            OPENFILENAMEA ofn = {0}; 
+            char path[32768] = ""; 
+            ofn.lStructSize = sizeof(ofn); 
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = "CSV/TXT Files (*.csv;*.txt)\0*.csv;*.txt\0All\0*.*\0"; 
+            ofn.lpstrFile = path; 
+            ofn.nMaxFile = 32768; 
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+            if (GetOpenFileNameA(&ofn)) {
+                if (path[ofn.nFileOffset - 1] == '\0') {
+                    char outList[32768] = "";
+                    char dir[MAX_PATH];
+                    strcpy(dir, path);
+                    char* file = path + ofn.nFileOffset;
+                    while (*file) {
+                        if (strlen(outList) > 0) strcat(outList, ";");
+                        strcat(outList, dir);
+                        strcat(outList, "\\");
+                        strcat(outList, file);
+                        file += strlen(file) + 1;
+                    }
+                    SetWindowTextA(hTxtCsvFiles, outList);
+                } else {
+                    SetWindowTextA(hTxtCsvFiles, path);
+                }
+            }
         } else if (LOWORD(wParam) == 2) { 
             OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
             ofn.lpstrFilter = "QJM Chunked File\0*.qjm\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT;
@@ -2519,8 +2765,9 @@ switch (msg) {
             GetWindowTextA(hTxtSimpHwyMin, buf, 16); g_SimpHwyMin = atoi(buf);
             GetWindowTextA(hTxtSimpWater, buf, 16); g_SimpWater = atoi(buf);
             GetWindowTextA(hTxtSimpPark, buf, 16); g_SimpPark = atoi(buf);
-            GetWindowTextA(hTxtSimpLowPoly, buf, 16); g_SimpLowPoly = atoi(buf);
             GetWindowTextA(hTxtSimpNoRoads, buf, 16); g_SimpNoRoads = atoi(buf);
+            
+            GetWindowTextA(hTxtCsvFiles, g_CsvFiles, sizeof(g_CsvFiles));
 
             CreateThread(NULL, 0, CompileThread, args, 0, NULL);
         } else if (LOWORD(wParam) == 4) {
