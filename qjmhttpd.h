@@ -4,7 +4,6 @@
 
 #ifndef QJMHTTPD_H
 #define QJMHTTPD_H
-
 #include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
@@ -14,13 +13,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
-
 #include "qjm.h"
-
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
-
 extern CRITICAL_SECTION g_FileCS;
 extern MapChunk* g_Chunks;
 extern uint32_t g_ChunkCount;
@@ -57,299 +53,336 @@ static void UrlDecode(char* dst, const char* src, size_t max_len) {
     dst[i] = '\0';
 }
 
-static const char* kHtmlApp =
-"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-"<title>QJM Map Web Navigator</title>"
-"<style>"
-"  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; background:#A3CCFF; }"
-"  #map { width:100%; height:100%; display:block; cursor:default; }"
-"  .panel { position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:8px; align-items:center; }"
-"  input, select, button { height:30px; border-radius:4px; border:1px solid #aaa; padding:0 8px; font-size:13px; outline:none; box-shadow:0 2px 4px rgba(0,0,0,0.15); }"
-"  button { background:#fff; cursor:pointer; font-weight:600; }"
-"  button:hover { background:#f0f0f0; }"
-"  #search { width:200px; }"
-"  #legend { position:absolute; top:55px; left:12px; width:260px; max-height:calc(100% - 75px); overflow-y:auto; background:rgba(250,248,245,0.95); border-radius:12px; border:1px solid #ccc; padding:12px; box-shadow:0 4px 12px rgba(0,0,0,0.15); z-index:10; display:none; font-size:12px; }"
-"  #legend h3 { margin:0 0 8px 0; font-size:13px; color:#222; border-bottom:1px solid #ddd; padding-bottom:4px; }"
-"  #legend ol { margin:0; padding-left:18px; line-height:1.5; color:#333; }"
-"  #search-results { position:absolute; top:44px; left:12px; width:216px; max-height:220px; overflow-y:auto; background:#fff; border:1px solid #aaa; border-radius:4px; box-shadow:0 4px 8px rgba(0,0,0,0.2); z-index:20; display:none; }"
-"  .search-item { padding:6px 10px; cursor:pointer; font-size:12px; border-bottom:1px solid #eee; }"
-"  .search-item:hover { background:#e8f0fe; }"
-"</style></head><body>"
-"<div class='panel'>"
-"  <input type='text' id='search' placeholder='Search street, postal code...' autocomplete='off'>"
-"  <button id='btnCancel' style='display:none;'>Cancel Route</button>"
-"  <select id='routeType' style='display:none;'><option value='0'>Fastest Route</option><option value='1'>Shortest Route</option></select>"
-"  <button id='btnExtents'>Zoom Extents</button>"
-"  <button id='btnPdf'>Export PDF</button>"
-"</div>"
-"<div id='search-results'></div>"
-"<div id='legend'><h3 id='legHdr'>Route</h3><ol id='legSteps'></ol></div>"
-"<canvas id='map'></canvas>"
-"<script>"
-"const canvas = document.getElementById('map'), ctx = canvas.getContext('2d');"
-"let view = { lon: -64.8, lat: 46.1, zoom: 5000 };"
-"let hasMaps = false;"
-"let pins = [], routePath = [], routeSteps = [], totalDist = 0, useMiles = false;"
-"let features = [];"
-"let isDragging = false, dragMoved = false, lastX = 0, lastY = 0;"
-"function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; render(); }"
-"window.addEventListener('resize', resize);"
-"function lonLatToScreen(lon, lat) { return [ (canvas.width / 2) + (lon - view.lon) * view.zoom, (canvas.height / 2) - (lat - view.lat) * view.zoom ]; }"
-"function screenToLonLat(x, y) { return [ view.lon + (x - canvas.width / 2) / view.zoom, view.lat - (y - canvas.height / 2) / view.zoom ]; }"
-"let isFetching = false, fetchQueued = false;"
-"async function fetchVectorData() {"
-"  if (isFetching) { fetchQueued = true; return; }"
-"  isFetching = true; fetchQueued = false;"
-"  const w = canvas.width, h = canvas.height;"
-"  const [minLon, maxLat] = screenToLonLat(0, 0);"
-"  const [maxLon, minLat] = screenToLonLat(w, h);"
-"  const url = `/api/data?minLon=${minLon}&maxLon=${maxLon}&minLat=${minLat}&maxLat=${maxLat}&zoom=${view.zoom}`;"
-"  try {"
-"    const res = await fetch(url);"
-"    const buf = await res.arrayBuffer();"
-"    const dv = new DataView(buf);"
-"    let off = 0;"
-"    if (buf.byteLength >= 4) {"
-"      const count = dv.getUint32(off, true); off += 4;"
-"      const newFeats = [];"
-"      for (let i = 0; i < count && off < buf.byteLength; i++) {"
-"        const fc = dv.getUint8(off++);"
-"        const isArea = dv.getUint8(off++);"
-"        const ptCnt = dv.getUint16(off, true); off += 2;"
-"        const nLen = dv.getUint16(off, true); off += 2;"
-"        let name = '';"
-"        if (nLen > 0) {"
-"          const nameBytes = new Uint8Array(buf, off, nLen);"
-"          name = new TextDecoder().decode(nameBytes); off += nLen;"
-"        }"
-"        const pts = new Float32Array(buf.slice(off, off + ptCnt * 8)); off += ptCnt * 8;"
-"        newFeats.push({ fc, isArea, pts, name });"
-"      }"
-"      features = newFeats; render();"
-"    }"
-"  } catch(e) { console.error(e); }"
-"  isFetching = false; if (fetchQueued) setTimeout(fetchVectorData, 80);"
-"}"
-"const COLORS = { 1: '#A3CCFF', 2: '#F2F0E9', 3: '#CADFAA', 4: '#6496B4', 5: '#FFFFFF', 6: '#FDB813', 7: '#E0E0E0', 8: '#D0D0D0' };"
-"function render() {"
-"  ctx.fillStyle = '#A3CCFF'; ctx.fillRect(0, 0, canvas.width, canvas.height);"
-"  if (!hasMaps) return;"
-"  const drawnNames = new Set();"
-"  const drawnBoxes = [];"
-"  for (let pass = 1; pass <= 7; pass++) {"
-"    if (pass <= 5) {"
-"      const groups = {};"
-"      for (let f of features) {"
-"        if (pass === 1 && (!f.isArea || (f.fc !== 2 && f.fc !== 4))) continue;"
-"        if (pass === 2 && (!f.isArea || (f.fc !== 1 && f.fc !== 3))) continue;"
-"        if (pass === 3 && (f.isArea || f.fc !== 4)) continue;"
-"        if (pass === 4 && f.fc !== 5) continue;"
-"        if (pass === 5 && f.fc !== 6) continue;"
-"        let k = f.isArea ? 'A'+f.fc : 'L'+f.fc;"
-"        if (!groups[k]) groups[k] = [];"
-"        groups[k].push(f);"
-"      }"
-"      for (let k in groups) {"
-"        ctx.beginPath();"
-"        const cx = canvas.width/2 - view.lon*view.zoom, cy = canvas.height/2 + view.lat*view.zoom, vz = view.zoom;"
-"        for (let f of groups[k]) {"
-"          const pts = f.pts, ptCnt = pts.length / 2;"
-"          for (let j = 0; j < ptCnt; j++) {"
-"            let sx = cx + pts[j*2]*vz, sy = cy - pts[j*2+1]*vz;"
-"            if (j === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);"
-"          }"
-"        }"
-"        if (k.charAt(0) === 'A') {"
-"          ctx.fillStyle = COLORS[parseInt(k.substring(1))] || '#fff'; ctx.fill();"
-"        } else {"
-"          let fc = parseInt(k.substring(1));"
-"          ctx.strokeStyle = COLORS[fc] || '#fff';"
-"          ctx.lineWidth = fc === 6 ? 4 : (fc === 5 ? 2.5 : 1.5);"
-"          ctx.stroke();"
-"        }"
-"      }"
-"    } else {"
-"      for (let f of features) {"
-"        if (drawnBoxes.length > 800) break;"
-"        if (pass === 6 && ((f.fc !== 6 && f.fc !== 7 && f.fc !== 8) || !f.name)) continue;"
-"        if (pass === 7 && (f.fc !== 5 || !f.name)) continue;"
-"        if (drawnNames.has(f.name)) continue;"
-"        const pts = f.pts, ptCnt = pts.length / 2;"
-"        let maxLen = 0, bestI = 0;"
-"        const cx_m = canvas.width/2 - view.lon*view.zoom, cy_m = canvas.height/2 + view.lat*view.zoom, vz = view.zoom;"
-"        for (let j = 0; j < ptCnt - 1; j++) {"
-"          let x1 = cx_m + pts[j*2]*vz, y1 = cy_m - pts[j*2+1]*vz;"
-"          let x2 = cx_m + pts[(j+1)*2]*vz, y2 = cy_m - pts[(j+1)*2+1]*vz;"
-"          let l = (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1);"
-"          if (l > maxLen) { maxLen = l; bestI = j; }"
-"        }"
-"        if (maxLen < (pass === 6 ? 120 : 30)) continue;"
-"        let p1x = cx_m + pts[bestI*2]*vz, p1y = cy_m - pts[bestI*2+1]*vz;"
-"        let p2x = cx_m + pts[(bestI+1)*2]*vz, p2y = cy_m - pts[(bestI+1)*2+1]*vz;"
-"        let cx = (p1x+p2x)/2, cy = (p1y+p2y)/2;"
-"        if (cx < -50 || cx > canvas.width+50 || cy < -50 || cy > canvas.height+50) continue;"
-"        ctx.font = 'bold 12px Arial';"
-"        let textW = ctx.measureText(f.name).width;"
-"        let overlap = false;"
-"        for(let i = 0; i < drawnBoxes.length; i++) {"
-"          let box = drawnBoxes[i];"
-"          if(Math.abs(cx - box.x) < (textW + box.w)/2 + 12 && Math.abs(cy - box.y) < 18) { overlap = true; break; }"
-"        }"
-"        if(overlap) continue;"
-"        drawnBoxes.push({x:cx, y:cy, w:textW});"
-"        drawnNames.add(f.name);"
-"        let ang = Math.atan2(p2y - p1y, p2x - p1x);"
-"        if (ang > Math.PI/2) ang -= Math.PI; else if (ang < -Math.PI/2) ang += Math.PI;"
-"        ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang);"
-"        ctx.fillStyle = '#333'; ctx.textAlign = 'center';"
-"        ctx.fillText(f.name, 0, -3); ctx.restore();"
-"      }"
-"    }"
-"  }"
-"  if (routePath.length > 1) {"
-"    ctx.beginPath(); ctx.strokeStyle = '#E22B8A'; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';"
-"    for (let i = 0; i < routePath.length; i++) {"
-"      const [sx, sy] = lonLatToScreen(routePath[i].lon, routePath[i].lat);"
-"      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);"
-"    }"
-"    ctx.stroke();"
-"  }"
-"  pins.forEach((p, idx) => {"
-"    const [sx, sy] = lonLatToScreen(p.lon, p.lat);"
-"    ctx.fillStyle = '#DC3232'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1;"
-"    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx-8, sy-18); ctx.lineTo(sx, sy-26); ctx.lineTo(sx+8, sy-18); ctx.closePath();"
-"    ctx.fill(); ctx.stroke();"
-"    ctx.fillStyle = '#000'; ctx.font = '12px Arial'; ctx.textAlign = 'center';"
-"    ctx.fillText(p.name || (idx + 1), sx, sy - 28);"
-"  });"
-"}"
-"let fetchTimer = null;"
-"function scheduleFetch() { clearTimeout(fetchTimer); fetchTimer = setTimeout(fetchVectorData, 80); }"
-"canvas.addEventListener('mousedown', e => { if (e.button === 0) { isDragging = true; dragMoved = false; lastX = e.clientX; lastY = e.clientY; } });"
-"window.addEventListener('mousemove', e => {"
-"  if (!isDragging) return;"
-"  const dx = e.clientX - lastX, dy = e.clientY - lastY;"
-"  if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved = true;"
-"  view.lon -= dx / view.zoom; view.lat += dy / view.zoom;"
-"  lastX = e.clientX; lastY = e.clientY;"
-"  render(); scheduleFetch();"
-"});"
-"window.addEventListener('mouseup', () => { isDragging = false; });"
-"canvas.addEventListener('wheel', e => {"
-"  e.preventDefault();"
-"  const factor = e.deltaY < 0 ? 1.25 : 0.8;"
-"  const [mX, mY] = [e.clientX, e.clientY];"
-"  const [lon, lat] = screenToLonLat(mX, mY);"
-"  view.zoom *= factor;"
-"  if(view.zoom > 1000000) view.zoom = 1000000;"
-"  view.lon = lon - (mX - canvas.width / 2) / view.zoom;"
-"  view.lat = lat + (mY - canvas.height / 2) / view.zoom;"
-"  render(); scheduleFetch();"
-"});"
-"async function updateWebRoute() {"
-"  if (pins.length < 2) {"
-"    routePath = []; routeSteps = [];"
-"    document.getElementById('btnCancel').style.display = 'none';"
-"    document.getElementById('routeType').style.display = 'none';"
-"    document.getElementById('legend').style.display = 'none';"
-"    render(); return;"
-"  }"
-"  const pinStr = pins.map(p => `${p.lon},${p.lat}`).join('|');"
-"  const mode = document.getElementById('routeType').value;"
-"  const res = await fetch(`/api/route?pins=${encodeURIComponent(pinStr)}&mode=${mode}`);"
-"  const data = await res.json();"
-"  routePath = data.path || []; routeSteps = data.steps || []; totalDist = data.totalDist || 0; useMiles = data.useMiles;"
-"  document.getElementById('btnCancel').style.display = 'inline-block';"
-"  document.getElementById('routeType').style.display = 'inline-block';"
-"  document.getElementById('legend').style.display = 'block';"
-"  document.getElementById('legHdr').innerText = `Total Distance: ${totalDist.toFixed(1)} ${useMiles ? 'mi' : 'km'}`;"
-"  document.getElementById('legSteps').innerHTML = routeSteps.map((s, i) => `<li>${s.text} (${s.dist.toFixed(1)} ${useMiles ? 'mi' : 'km'})</li>`).join('');"
-"  render();"
-"}"
-"canvas.addEventListener('dblclick', async e => {"
-"  const mx = e.clientX, my = e.clientY;"
-"  for (let i = 0; i < pins.length; i++) {"
-"    const [px, py] = lonLatToScreen(pins[i].lon, pins[i].lat);"
-"    if (Math.abs(mx - px) <= 16 && (my - py) >= -38 && (my - py) <= 8) {"
-"      const newName = prompt('Edit pin name:', pins[i].name);"
-"      if (newName !== null) {"
-"        pins[i].name = newName;"
-"        render();"
-"        await updateWebRoute();"
-"      }"
-"      return;"
-"    }"
-"  }"
-"  let [lon, lat] = screenToLonLat(mx, my);"
-"  let bestLon = lon, bestLat = lat;"
-"  let snapDist = Infinity, snapRad = Math.max(0.04, 35.0 / view.zoom);"
-"  for (let f of features) {"
-"    if (f.fc !== 5 && f.fc !== 6) continue;"
-"    const pts = f.pts;"
-"    for (let j = 0; j < pts.length; j += 2) {"
-"      let px = pts[j], py = pts[j+1];"
-"      if (px < lon - snapRad || px > lon + snapRad || py < lat - snapRad || py > lat + snapRad) continue;"
-"      let d = (px - lon)**2 + (py - lat)**2;"
-"      if (d < snapDist) { snapDist = d; bestLon = px; bestLat = py; }"
-"    }"
-"  }"
-"  pins.push({ lon: bestLon, lat: bestLat, name: (pins.length + 1).toString() });"
-"  render();"
-"  if (pins.length >= 2) await updateWebRoute();"
-"});"
-"canvas.addEventListener('contextmenu', async e => {"
-"  e.preventDefault();"
-"  const mx = e.clientX, my = e.clientY;"
-"  for (let i = 0; i < pins.length; i++) {"
-"    const [px, py] = lonLatToScreen(pins[i].lon, pins[i].lat);"
-"    if (Math.abs(mx - px) <= 16 && (my - py) >= -38 && (my - py) <= 8) {"
-"      pins.splice(i, 1);"
-"      await updateWebRoute();"
-"      return;"
-"    }"
-"  }"
-"});"
-"document.getElementById('routeType').addEventListener('change', updateWebRoute);"
-"document.getElementById('btnCancel').addEventListener('click', () => {"
-"  pins = []; routePath = []; routeSteps = [];"
-"  document.getElementById('btnCancel').style.display = 'none';"
-"  document.getElementById('routeType').style.display = 'none';"
-"  document.getElementById('legend').style.display = 'none';"
-"  render();"
-"});"
-"async function zoomToExtents() {"
-"  try {"
-"    const res = await fetch(`/api/state?w=${window.innerWidth}&h=${window.innerHeight}`);"
-"    const st = await res.json();"
-"    view.lon = st.lon; view.lat = st.lat; view.zoom = st.zoom; hasMaps = st.hasMaps;"
-"    render(); scheduleFetch();"
-"  } catch(e) {}"
-"}"
-"document.getElementById('btnExtents').addEventListener('click', zoomToExtents);"
-"document.getElementById('btnPdf').addEventListener('click', () => {"
-"  const pinStr = pins.map(p => `${p.lon},${p.lat}`).join('|');"
-"  const mode = document.getElementById('routeType').value;"
-"  window.location.href = `/api/pdf?title=Browser Map&lon=${view.lon}&lat=${view.lat}&zoom=${view.zoom}&w=${canvas.width}&h=${canvas.height}&mode=${mode}&pins=${encodeURIComponent(pinStr)}`;"
-"});"
-"const searchBox = document.getElementById('search');"
-"const searchRes = document.getElementById('search-results');"
-"searchBox.addEventListener('input', async () => {"
-"  if (searchBox.value.length < 2) { searchRes.style.display = 'none'; return; }"
-"  const res = await fetch(`/api/search?q=${encodeURIComponent(searchBox.value)}`);"
-"  const list = await res.json();"
-"  if (!list.length) { searchRes.style.display = 'none'; return; }"
-"  searchRes.innerHTML = list.map(item => `<div class='search-item' data-lon='${item.lon}' data-lat='${item.lat}'>${item.name || ''} ${item.pcode || ''}</div>`).join('');"
-"  searchRes.style.display = 'block';"
-"});"
-"searchRes.addEventListener('click', e => {"
-"  const t = e.target.closest('.search-item'); if (!t) return;"
-"  view.lon = parseFloat(t.dataset.lon); view.lat = parseFloat(t.dataset.lat); view.zoom = 25000;"
-"  searchRes.style.display = 'none'; searchBox.value = '';"
-"  render(); scheduleFetch();"
-"});"
-"resize(); zoomToExtents();"
-"</script></body></html>";
-
+// ============================================================================
+// qjmhttpd.h - HTTP Replications for Postal Codes, Coordinates, 
+// Keyboard Search, and Extents
+// ============================================================================
+
+static const char* kHtmlApp =
+"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+"<title>QJM Map Web Navigator</title>"
+"<style>"
+"  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif; background:#A3CCFF; }"
+"  #map { width:100%; height:100%; display:block; cursor:default; }"
+"  .panel { position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:8px; align-items:center; }"
+"  input, select, button { height:30px; border-radius:4px; border:1px solid #aaa; padding:0 8px; font-size:13px; outline:none; box-shadow:0 2px 4px rgba(0,0,0,0.15); }"
+"  button { background:#fff; cursor:pointer; font-weight:600; }"
+"  button:hover { background:#f0f0f0; }"
+"  #search { width:200px; }"
+"  #legend { position:absolute; top:55px; left:12px; width:260px; max-height:calc(100% - 75px); overflow-y:auto; background:rgba(250,248,245,0.95); border-radius:12px; border:1px solid #ccc; padding:12px; box-shadow:0 4px 12px rgba(0,0,0,0.15); z-index:10; display:none; font-size:12px; }"
+"  #legend h3 { margin:0 0 8px 0; font-size:13px; color:#222; border-bottom:1px solid #ddd; padding-bottom:4px; }"
+"  #legend ol { margin:0; padding-left:18px; line-height:1.5; color:#333; }"
+"  #search-results { position:absolute; top:44px; left:12px; width:216px; max-height:220px; overflow-y:auto; background:#fff; border:1px solid #aaa; border-radius:4px; box-shadow:0 4px 8px rgba(0,0,0,0.2); z-index:20; display:none; }"
+"  .search-item { padding:6px 10px; cursor:pointer; font-size:12px; border-bottom:1px solid #eee; }"
+"  .search-item:hover { background:#e8f0fe; }"
+"</style></head><body>"
+"<div class='panel'>"
+"  <input type='text' id='search' placeholder='Search street, postal code...' autocomplete='off'>"
+"  <button id='btnCancel' style='display:none;'>Cancel Route</button>"
+"  <select id='routeType' style='display:none;'><option value='0'>Fastest Route</option><option value='1'>Shortest Route</option></select>"
+"  <button id='btnExtents'>Zoom Extents</button>"
+"  <button id='btnPdf'>Export PDF</button>"
+"</div>"
+"<div id='search-results'></div>"
+"<div id='legend'><h3 id='legHdr'>Route</h3><ol id='legSteps'></ol></div>"
+"<canvas id='map'></canvas>"
+"<script>"
+"const canvas = document.getElementById('map'), ctx = canvas.getContext('2d');"
+"let view = { lon: -64.8, lat: 46.1, zoom: 5000 };"
+"let hasMaps = false;"
+"let pins = [], routePath = [], routeSteps = [], totalDist = 0, useMiles = false;"
+"let features = [];"
+"let isDragging = false, dragMoved = false, lastX = 0, lastY = 0;"
+"function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; render(); }"
+"window.addEventListener('resize', resize);"
+"function lonLatToScreen(lon, lat) { return [ (canvas.width / 2) + (lon - view.lon) * view.zoom, (canvas.height / 2) - (lat - view.lat) * view.zoom ]; }"
+"function screenToLonLat(x, y) { return [ view.lon + (x - canvas.width / 2) / view.zoom, view.lat - (y - canvas.height / 2) / view.zoom ]; }"
+"let isFetching = false, fetchQueued = false;"
+"async function fetchVectorData() {"
+"  if (isFetching) { fetchQueued = true; return; }"
+"  isFetching = true; fetchQueued = false;"
+"  const w = canvas.width, h = canvas.height;"
+"  const [minLon, maxLat] = screenToLonLat(0, 0);"
+"  const [maxLon, minLat] = screenToLonLat(w, h);"
+"  const url = `/api/data?minLon=${minLon}&maxLon=${maxLon}&minLat=${minLat}&maxLat=${maxLat}&zoom=${view.zoom}`;"
+"  try {"
+"    const res = await fetch(url);"
+"    const buf = await res.arrayBuffer();"
+"    const dv = new DataView(buf);"
+"    let off = 0;"
+"    if (buf.byteLength >= 4) {"
+"      const count = dv.getUint32(off, true); off += 4;"
+"      const newFeats = [];"
+"      for (let i = 0; i < count && off < buf.byteLength; i++) {"
+"        const fc = dv.getUint8(off++);"
+"        const isArea = dv.getUint8(off++);"
+"        const ptCnt = dv.getUint16(off, true); off += 2;"
+"        const nLen = dv.getUint16(off, true); off += 2;"
+"        let name = '';"
+"        if (nLen > 0) {"
+"          const nameBytes = new Uint8Array(buf, off, nLen);"
+"          name = new TextDecoder().decode(nameBytes); off += nLen;"
+"        }"
+"        const pts = new Float32Array(buf.slice(off, off + ptCnt * 8)); off += ptCnt * 8;"
+"        newFeats.push({ fc, isArea, pts, name });"
+"      }"
+"      features = newFeats; render();"
+"    }"
+"  } catch(e) { console.error(e); }"
+"  isFetching = false; if (fetchQueued) setTimeout(fetchVectorData, 80);"
+"}"
+"const COLORS = { 1: '#A3CCFF', 2: '#F2F0E9', 3: '#CADFAA', 4: '#6496B4', 5: '#FFFFFF', 6: '#FDB813', 7: '#E0E0E0', 8: '#D0D0D0' };"
+"function render() {"
+"  ctx.fillStyle = '#A3CCFF'; ctx.fillRect(0, 0, canvas.width, canvas.height);"
+"  if (!hasMaps) return;"
+"  const drawnNames = new Set();"
+"  const drawnBoxes = [];"
+"  for (let pass = 1; pass <= 7; pass++) {"
+"    if (pass <= 5) {"
+"      const groups = {};"
+"      for (let f of features) {"
+"        if (pass === 1 && (!f.isArea || (f.fc !== 2 && f.fc !== 4))) continue;"
+"        if (pass === 2 && (!f.isArea || (f.fc !== 1 && f.fc !== 3))) continue;"
+"        if (pass === 3 && (f.isArea || f.fc !== 4)) continue;"
+"        if (pass === 4 && f.fc !== 5) continue;"
+"        if (pass === 5 && f.fc !== 6) continue;"
+"        let k = f.isArea ? 'A'+f.fc : 'L'+f.fc;"
+"        if (!groups[k]) groups[k] = [];"
+"        groups[k].push(f);"
+"      }"
+"      for (let k in groups) {"
+"        ctx.beginPath();"
+"        const cx = canvas.width/2 - view.lon*view.zoom, cy = canvas.height/2 + view.lat*view.zoom, vz = view.zoom;"
+"        for (let f of groups[k]) {"
+"          const pts = f.pts, ptCnt = pts.length / 2;"
+"          for (let j = 0; j < ptCnt; j++) {"
+"            let sx = cx + pts[j*2]*vz, sy = cy - pts[j*2+1]*vz;"
+"            if (j === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);"
+"          }"
+"        }"
+"        if (k.charAt(0) === 'A') {"
+"          ctx.fillStyle = COLORS[parseInt(k.substring(1))] || '#fff'; ctx.fill();"
+"        } else {"
+"          let fc = parseInt(k.substring(1));"
+"          ctx.strokeStyle = COLORS[fc] || '#fff';"
+"          ctx.lineWidth = fc === 6 ? 4 : (fc === 5 ? 2.5 : 1.5);"
+"          ctx.stroke();"
+"        }"
+"      }"
+"    } else {"
+"      for (let f of features) {"
+"        if (drawnBoxes.length > 800) break;"
+"        if (pass === 6 && ((f.fc !== 6 && f.fc !== 7 && f.fc !== 8) || !f.name)) continue;"
+"        if (pass === 7 && (f.fc !== 5 || !f.name)) continue;"
+"        if (drawnNames.has(f.name)) continue;"
+"        const pts = f.pts, ptCnt = pts.length / 2;"
+"        let maxLen = 0, bestI = 0;"
+"        const cx_m = canvas.width/2 - view.lon*view.zoom, cy_m = canvas.height/2 + view.lat*view.zoom, vz = view.zoom;"
+"        for (let j = 0; j < ptCnt - 1; j++) {"
+"          let x1 = cx_m + pts[j*2]*vz, y1 = cy_m - pts[j*2+1]*vz;"
+"          let x2 = cx_m + pts[(j+1)*2]*vz, y2 = cy_m - pts[(j+1)*2+1]*vz;"
+"          let l = (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1);"
+"          if (l > maxLen) { maxLen = l; bestI = j; }"
+"        }"
+"        if (maxLen < (pass === 6 ? 120 : 30)) continue;"
+"        let p1x = cx_m + pts[bestI*2]*vz, p1y = cy_m - pts[bestI*2+1]*vz;"
+"        let p2x = cx_m + pts[(bestI+1)*2]*vz, p2y = cy_m - pts[(bestI+1)*2+1]*vz;"
+"        let cx = (p1x+p2x)/2, cy = (p1y+p2y)/2;"
+"        if (cx < -50 || cx > canvas.width+50 || cy < -50 || cy > canvas.height+50) continue;"
+"        ctx.font = 'bold 12px Arial';"
+"        let textW = ctx.measureText(f.name).width;"
+"        let overlap = false;"
+"        for(let i = 0; i < drawnBoxes.length; i++) {"
+"          let box = drawnBoxes[i];"
+"          if(Math.abs(cx - box.x) < (textW + box.w)/2 + 12 && Math.abs(cy - box.y) < 18) { overlap = true; break; }"
+"        }"
+"        if(overlap) continue;"
+"        drawnBoxes.push({x:cx, y:cy, w:textW});"
+"        drawnNames.add(f.name);"
+"        let ang = Math.atan2(p2y - p1y, p2x - p1x);"
+"        if (ang > Math.PI/2) ang -= Math.PI; else if (ang < -Math.PI/2) ang += Math.PI;"
+"        ctx.save(); ctx.translate(cx, cy); ctx.rotate(ang);"
+"        ctx.fillStyle = '#333'; ctx.textAlign = 'center';"
+"        ctx.fillText(f.name, 0, -3); ctx.restore();"
+"      }"
+"    }"
+"  }"
+"  if (routePath.length > 1) {"
+"    ctx.beginPath(); ctx.strokeStyle = '#E22B8A'; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';"
+"    for (let i = 0; i < routePath.length; i++) {"
+"      const [sx, sy] = lonLatToScreen(routePath[i].lon, routePath[i].lat);"
+"      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);"
+"    }"
+"    ctx.stroke();"
+"  }"
+"  pins.forEach((p, idx) => {"
+"    const [sx, sy] = lonLatToScreen(p.lon, p.lat);"
+"    ctx.fillStyle = '#DC3232'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1;"
+"    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx-8, sy-18); ctx.lineTo(sx, sy-26); ctx.lineTo(sx+8, sy-18); ctx.closePath();"
+"    ctx.fill(); ctx.stroke();"
+"    ctx.fillStyle = '#000'; ctx.font = '12px Arial'; ctx.textAlign = 'center';"
+"    ctx.fillText(p.name || (idx + 1), sx, sy - 28);"
+"  });"
+"}"
+"let fetchTimer = null;"
+"function scheduleFetch() { clearTimeout(fetchTimer); fetchTimer = setTimeout(fetchVectorData, 80); }"
+"canvas.addEventListener('mousedown', e => { if (e.button === 0) { isDragging = true; dragMoved = false; lastX = e.clientX; lastY = e.clientY; } });"
+"window.addEventListener('mousemove', e => {"
+"  if (!isDragging) return;"
+"  const dx = e.clientX - lastX, dy = e.clientY - lastY;"
+"  if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragMoved = true;"
+"  view.lon -= dx / view.zoom; view.lat += dy / view.zoom;"
+"  lastX = e.clientX; lastY = e.clientY;"
+"  render(); scheduleFetch();"
+"});"
+"window.addEventListener('mouseup', () => { isDragging = false; });"
+"canvas.addEventListener('wheel', e => {"
+"  e.preventDefault();"
+"  const factor = e.deltaY < 0 ? 1.25 : 0.8;"
+"  const [mX, mY] = [e.clientX, e.clientY];"
+"  const [lon, lat] = screenToLonLat(mX, mY);"
+"  view.zoom *= factor;"
+"  if(view.zoom > 1000000) view.zoom = 1000000;"
+"  view.lon = lon - (mX - canvas.width / 2) / view.zoom;"
+"  view.lat = lat + (mY - canvas.height / 2) / view.zoom;"
+"  render(); scheduleFetch();"
+"});"
+"async function updateWebRoute() {"
+"  if (pins.length < 2) {"
+"    routePath = []; routeSteps = [];"
+"    document.getElementById('btnCancel').style.display = 'none';"
+"    document.getElementById('routeType').style.display = 'none';"
+"    document.getElementById('legend').style.display = 'none';"
+"    render(); return;"
+"  }"
+"  const pinStr = pins.map(p => `${p.lon},${p.lat}`).join('|');"
+"  const mode = document.getElementById('routeType').value;"
+"  const res = await fetch(`/api/route?pins=${encodeURIComponent(pinStr)}&mode=${mode}`);"
+"  const data = await res.json();"
+"  routePath = data.path || []; routeSteps = data.steps || []; totalDist = data.totalDist || 0; useMiles = data.useMiles;"
+"  document.getElementById('btnCancel').style.display = 'inline-block';"
+"  document.getElementById('routeType').style.display = 'inline-block';"
+"  document.getElementById('legend').style.display = 'block';"
+"  document.getElementById('legHdr').innerText = `Total Distance: ${totalDist.toFixed(1)} ${useMiles ? 'mi' : 'km'}`;"
+"  document.getElementById('legSteps').innerHTML = routeSteps.map((s, i) => `<li>${s.text} (${s.dist.toFixed(1)} ${useMiles ? 'mi' : 'km'})</li>`).join('');"
+"  render();"
+"}"
+"canvas.addEventListener('dblclick', async e => {"
+"  const mx = e.clientX, my = e.clientY;"
+"  for (let i = 0; i < pins.length; i++) {"
+"    const [px, py] = lonLatToScreen(pins[i].lon, pins[i].lat);"
+"    if (Math.abs(mx - px) <= 16 && (my - py) >= -38 && (my - py) <= 8) {"
+"      const newName = prompt('Edit pin name:', pins[i].name);"
+"      if (newName !== null) {"
+"        pins[i].name = newName;"
+"        render();"
+"        await updateWebRoute();"
+"      }"
+"      return;"
+"    }"
+"  }"
+"  let [lon, lat] = screenToLonLat(mx, my);"
+"  let bestLon = lon, bestLat = lat;"
+"  let snapDist = Infinity, snapRad = Math.max(0.04, 35.0 / view.zoom);"
+"  for (let f of features) {"
+"    if (f.fc !== 5 && f.fc !== 6) continue;"
+"    const pts = f.pts;"
+"    for (let j = 0; j < pts.length; j += 2) {"
+"      let px = pts[j], py = pts[j+1];"
+"      if (px < lon - snapRad || px > lon + snapRad || py < lat - snapRad || py > lat + snapRad) continue;"
+"      let d = (px - lon)**2 + (py - lat)**2;"
+"      if (d < snapDist) { snapDist = d; bestLon = px; bestLat = py; }"
+"    }"
+"  }"
+"  pins.push({ lon: bestLon, lat: bestLat, name: (pins.length + 1).toString() });"
+"  render();"
+"  if (pins.length >= 2) await updateWebRoute();"
+"});"
+"canvas.addEventListener('contextmenu', async e => {"
+"  e.preventDefault();"
+"  const mx = e.clientX, my = e.clientY;"
+"  for (let i = 0; i < pins.length; i++) {"
+"    const [px, py] = lonLatToScreen(pins[i].lon, pins[i].lat);"
+"    if (Math.abs(mx - px) <= 16 && (my - py) >= -38 && (my - py) <= 8) {"
+"      pins.splice(i, 1);"
+"      await updateWebRoute();"
+"      return;"
+"    }"
+"  }"
+"});"
+"document.getElementById('routeType').addEventListener('change', updateWebRoute);"
+"document.getElementById('btnCancel').addEventListener('click', () => {"
+"  pins = []; routePath = []; routeSteps = [];"
+"  document.getElementById('btnCancel').style.display = 'none';"
+"  document.getElementById('routeType').style.display = 'none';"
+"  document.getElementById('legend').style.display = 'none';"
+"  render();"
+"});"
+"async function zoomToExtents() {"
+"  try {"
+"    const res = await fetch(`/api/state?w=${window.innerWidth}&h=${window.innerHeight}`);"
+"    const st = await res.json();"
+"    hasMaps = st.hasMaps;"
+"    if (pins.length === 0) {"
+"      view.lon = st.lon; view.lat = st.lat; view.zoom = st.zoom;"
+"    } else {"
+"      let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90;"
+"      pins.forEach(p => {"
+"        if (p.lon < minLon) minLon = p.lon;"
+"        if (p.lon > maxLon) maxLon = p.lon;"
+"        if (p.lat < minLat) minLat = p.lat;"
+"        if (p.lat > maxLat) maxLat = p.lat;"
+"      });"
+"      view.lon = (minLon + maxLon) / 2; view.lat = (minLat + maxLat) / 2;"
+"      if (maxLon - minLon < 0.0001 || maxLat - minLat < 0.0001) view.zoom = 25000;"
+"      else {"
+"        let zX = (window.innerWidth - 40) / (maxLon - minLon);"
+"        let zY = (window.innerHeight - 40) / (maxLat - minLat);"
+"        view.zoom = Math.min(zX, zY) * 0.85;"
+"      }"
+"    }"
+"    render(); scheduleFetch();"
+"  } catch(e) {}"
+"}"
+"document.getElementById('btnExtents').addEventListener('click', zoomToExtents);"
+"document.getElementById('btnPdf').addEventListener('click', () => {"
+"  const pinStr = pins.map(p => `${p.lon},${p.lat}`).join('|');"
+"  const mode = document.getElementById('routeType').value;"
+"  window.location.href = `/api/pdf?title=Browser Map&lon=${view.lon}&lat=${view.lat}&zoom=${view.zoom}&w=${canvas.width}&h=${canvas.height}&mode=${mode}&pins=${encodeURIComponent(pinStr)}`;"
+"});"
+"const searchBox = document.getElementById('search');"
+"const searchRes = document.getElementById('search-results');"
+"let selIdx = -1;"
+"searchBox.addEventListener('keydown', e => {"
+"  const items = searchRes.querySelectorAll('.search-item');"
+"  if (!items.length) return;"
+"  if (e.key === 'ArrowDown') { e.preventDefault(); selIdx = (selIdx + 1) % items.length; updateSel(items); }"
+"  else if (e.key === 'ArrowUp') { e.preventDefault(); selIdx = (selIdx - 1 + items.length) % items.length; updateSel(items); }"
+"  else if (e.key === 'Enter') { e.preventDefault(); if (selIdx >= 0 && selIdx < items.length) items[selIdx].click(); }"
+"  else if (e.key === 'Escape') { searchRes.style.display = 'none'; }"
+"});"
+"function updateSel(items) { items.forEach((it, i) => { if (i === selIdx) it.style.background = '#e8f0fe'; else it.style.background = ''; }); }"
+"searchBox.addEventListener('input', async () => {"
+"  selIdx = -1;"
+"  if (searchBox.value.length < 2) { searchRes.style.display = 'none'; return; }"
+"  const res = await fetch(`/api/search?q=${encodeURIComponent(searchBox.value)}`);"
+"  const list = await res.json();"
+"  if (!list.length) { searchRes.style.display = 'none'; return; }"
+"  searchRes.innerHTML = list.map(item => `<div class='search-item' data-lon='${item.lon}' data-lat='${item.lat}' data-name='${item.name || ''}' data-pcode='${item.pcode || ''}'>${item.name || ''} ${item.pcode || ''}</div>`).join('');"
+"  searchRes.style.display = 'block';"
+"});"
+"searchRes.addEventListener('click', async e => {"
+"  const t = e.target.closest('.search-item'); if (!t) return;"
+"  view.lon = parseFloat(t.dataset.lon); view.lat = parseFloat(t.dataset.lat); view.zoom = 25000;"
+"  searchRes.style.display = 'none'; searchBox.value = '';"
+"  let pName = t.dataset.pcode || t.dataset.name || (pins.length + 1).toString();"
+"  pins.push({ lon: view.lon, lat: view.lat, name: pName });"
+"  render(); scheduleFetch();"
+"  if (pins.length >= 2) await updateWebRoute();"
+"});"
+"resize(); zoomToExtents();"
+"</script></body></html>";
+
 static void SendHttpResponse(SOCKET s, const char* content_type, const void* data, size_t len, const char* extra_headers) {
     char header[512];
     int hlen = snprintf(header, sizeof(header),
@@ -589,34 +622,52 @@ static void HandleApiRoute(SOCKET s, const char* query) {
     if (route_steps) free(route_steps);
 }
 
-static void HandleApiSearch(SOCKET s, const char* query) {
-    const char* q = strstr(query, "q=");
-    char raw_str[128] = {0}, search_str[128] = {0};
-    if (q) {
-        strncpy(raw_str, q + 2, sizeof(raw_str) - 1);
-        char* end = strchr(raw_str, '&'); if (end) *end = '\0';
-        UrlDecode(search_str, raw_str, sizeof(search_str));
-    }
-
-    char* json = (char*)malloc(128 * 1024);
-    int jlen = snprintf(json, 128 * 1024, "[");
-    int count = 0;
-
-    for (uint32_t i = 0; i < g_SearchItemCount && count < 25; i++) {
-        SearchItem* it = &g_SearchItems[i];
-        bool match = (it->name && FindSubStringIC(it->name, search_str)) ||
-                     (it->pcode && FindSubStringIC(it->pcode, search_str));
-        if (match) {
-            jlen += snprintf(json + jlen, 128 * 1024 - jlen, "%s{\"name\":\"%s\",\"pcode\":\"%s\",\"lon\":%.6f,\"lat\":%.6f}",
-                count > 0 ? "," : "", it->name ? it->name : "", it->pcode ? it->pcode : "", it->lon, it->lat);
-            count++;
-        }
-    }
-    jlen += snprintf(json + jlen, 128 * 1024 - jlen, "]");
-    SendHttpResponse(s, "application/json", json, jlen, NULL);
-    free(json);
-}
-
+static void HandleApiSearch(SOCKET s, const char* query) {
+    const char* q = strstr(query, "q=");
+    char raw_str[128] = {0}, search_str[128] = {0};
+    if (q) {
+        strncpy(raw_str, q + 2, sizeof(raw_str) - 1);
+        char* end = strchr(raw_str, '&'); if (end) *end = '\0';
+        UrlDecode(search_str, raw_str, sizeof(search_str));
+    }
+
+    char search_pc[128];
+    int spc_idx = 0;
+    for (int i = 0; search_str[i]; i++) {
+        if (search_str[i] != ' ') search_pc[spc_idx++] = search_str[i];
+    }
+    search_pc[spc_idx] = '\0';
+
+    char* json = (char*)malloc(128 * 1024);
+    int jlen = snprintf(json, 128 * 1024, "[");
+    int count = 0;
+
+    for (uint32_t i = 0; i < g_SearchItemCount && count < 25; i++) {
+        SearchItem* it = &g_SearchItems[i];
+        bool match = false;
+
+        if (it->name && FindSubStringIC(it->name, search_str)) match = true;
+        if (!match && it->pcode) {
+            char item_pc[128];
+            int idx = 0;
+            for (int j = 0; it->pcode[j]; j++) {
+                if (it->pcode[j] != ' ') item_pc[idx++] = it->pcode[j];
+            }
+            item_pc[idx] = '\0';
+            if (FindSubStringIC(item_pc, search_pc)) match = true;
+        }
+
+        if (match) {
+            jlen += snprintf(json + jlen, 128 * 1024 - jlen, "%s{\"name\":\"%s\",\"pcode\":\"%s\",\"lon\":%.6f,\"lat\":%.6f}",
+                count > 0 ? "," : "", it->name ? it->name : "", it->pcode ? it->pcode : "", it->lon, it->lat);
+            count++;
+        }
+    }
+    jlen += snprintf(json + jlen, 128 * 1024 - jlen, "]");
+    SendHttpResponse(s, "application/json", json, jlen, NULL);
+    free(json);
+}
+
 static void HandleApiPdf(SOCKET s, const char* query) {
     double lon = g_CenterLon, lat = g_CenterLat, zoom = g_Zoom;
     double view_w = 1280.0, view_h = 800.0;
@@ -697,117 +748,181 @@ static void HandleApiPdf(SOCKET s, const char* query) {
     free(buf);
 }
 
-static void HandleApiCmd(SOCKET s, const char* query) {
-    const char* q = strstr(query, "q=");
-    if (!q) { SendHttpResponse(s, "application/json", "{}", 2, NULL); return; }
-
-    char raw_str[4096] = {0}, cmd_str[4096] = {0};
-    strncpy(raw_str, q + 2, sizeof(raw_str) - 1);
-    char* end = strchr(raw_str, '&'); if (end) *end = '\0';
-    UrlDecode(cmd_str, raw_str, sizeof(cmd_str));
-
-    bool do_route = true;
-    const char* start = cmd_str;
-    if (strncmp(start, "plot:", 5) == 0) { do_route = false; start += 5; }
-    else if (strncmp(start, "route:", 6) == 0) { do_route = true; start += 6; }
-    else if (strncmp(start, "pins=", 5) == 0) { start += 5; }
-
-    char buf[8192];
-    strncpy(buf, start, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    MapPin web_pins[1000];
-    int web_pin_cnt = 0;
-
-    char* token = strtok(buf, "|");
-    while (token && web_pin_cnt < 1000) {
-        char* pLong = strstr(token, ":long:");
-        char* pLat = strstr(token, ":lat:");
-        if (pLong && pLat) {
-            *pLong = '\0';
-            strncpy(web_pins[web_pin_cnt].name, token, 127);
-            web_pins[web_pin_cnt].lon = atof(pLong + 6);
-            web_pins[web_pin_cnt].lat = atof(pLat + 5);
-            *pLong = ':';
-            web_pin_cnt++;
-        } else {
-            double found_lon = 0, found_lat = 0;
-            bool found = false;
-            EnterCriticalSection(&g_FileCS);
-            for (uint32_t i = 0; i < g_SearchItemCount; i++) {
-                SearchItem* item = &g_SearchItems[i];
-                if ((item->pcode && strcasecmp(item->pcode, token) == 0) ||
-                    (item->name && strcasecmp(item->name, token) == 0)) {
-                    found_lon = item->lon;
-                    found_lat = item->lat;
-                    found = true;
-                    break;
-                }
-            }
-            LeaveCriticalSection(&g_FileCS);
-            if (found) {
-                strncpy(web_pins[web_pin_cnt].name, token, 127);
-                web_pins[web_pin_cnt].lon = found_lon;
-                web_pins[web_pin_cnt].lat = found_lat;
-                web_pin_cnt++;
-            }
-        }
-        token = strtok(NULL, "|");
-    }
-
-    size_t j_cap = 1024 * 1024;
-    char* json = (char*)malloc(j_cap);
-    int jlen = snprintf(json, j_cap, "{");
-
-    jlen += snprintf(json + jlen, j_cap - jlen, "\"pins\":[");
-    for (int i = 0; i < web_pin_cnt; i++) {
-        char escaped[256] = {0}; int k = 0;
-        for (int m = 0; web_pins[i].name[m] && k < 250; m++) {
-            if (web_pins[i].name[m] == '"') escaped[k++] = '\\';
-            escaped[k++] = web_pins[i].name[m];
-        }
-        jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"name\":\"%s\",\"lon\":%.6f,\"lat\":%.6f}",
-            (i > 0 ? "," : ""), escaped, web_pins[i].lon, web_pins[i].lat);
-    }
-    jlen += snprintf(json + jlen, j_cap - jlen, "]");
-
-    if (do_route && web_pin_cnt >= 2) {
-        MapPoint* route_path = NULL; int route_path_cnt = 0;
-        RouteStep* route_steps = NULL; int route_step_cnt = 0;
-        double total_dist = 0.0; bool use_miles = false;
-
-        CalculateRouteForPins(web_pins, web_pin_cnt, 0, &route_path, &route_path_cnt, &route_steps, &route_step_cnt, &total_dist, &use_miles);
-
-        jlen += snprintf(json + jlen, j_cap - jlen, ",\"totalDist\":%.2f,\"useMiles\":%s,\"steps\":[", total_dist, use_miles ? "true" : "false");
-        for (int i = 0; i < route_step_cnt; i++) {
-            if (jlen + 512 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
-            char escaped[256] = {0}; int k = 0;
-            for (int m = 0; route_steps[i].text[m] && k < 250; m++) {
-                if (route_steps[i].text[m] == '"') escaped[k++] = '\\';
-                escaped[k++] = route_steps[i].text[m];
-            }
-            jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"text\":\"%s\",\"dist\":%.2f}",
-                (i > 0 ? "," : ""), escaped, route_steps[i].dist);
-        }
-        
-        if (jlen + 128 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
-        jlen += snprintf(json + jlen, j_cap - jlen, "],\"path\":[");
-        for (int i = 0; i < route_path_cnt; i++) {
-            if (jlen + 128 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
-            jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"lon\":%.6f,\"lat\":%.6f}",
-                (i > 0 ? "," : ""), route_path[i].lon, route_path[i].lat);
-        }
-        jlen += snprintf(json + jlen, j_cap - jlen, "]");
-
-        if (route_path) free(route_path);
-        if (route_steps) free(route_steps);
-    }
-    
-    jlen += snprintf(json + jlen, j_cap - jlen, "}");
-    SendHttpResponse(s, "application/json", json, jlen, NULL);
-    free(json);
-}
-
+static void HandleApiCmd(SOCKET s, const char* query) {
+    const char* q = strstr(query, "q=");
+    if (!q) { SendHttpResponse(s, "application/json", "{}", 2, NULL); return; }
+
+    char raw_str[4096] = {0}, cmd_str[4096] = {0};
+    strncpy(raw_str, q + 2, sizeof(raw_str) - 1);
+    char* end = strchr(raw_str, '&'); if (end) *end = '\0';
+    UrlDecode(cmd_str, raw_str, sizeof(cmd_str));
+
+    bool do_route = true;
+    const char* start = cmd_str;
+    if (strncmp(start, "plot:", 5) == 0) { do_route = false; start += 5; }
+    else if (strncmp(start, "route:", 6) == 0) { do_route = true; start += 6; }
+    else if (strncmp(start, "pins=", 5) == 0) { start += 5; }
+
+    char buf[8192];
+    strncpy(buf, start, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    MapPin web_pins[1000];
+    int web_pin_cnt = 0;
+
+    char* token = strtok(buf, "|");
+    while (token && web_pin_cnt < 1000) {
+        while (*token == ' ') token++;
+        
+        char* pLong = strstr(token, ":long:");
+        char* pLat = strstr(token, ":lat:");
+        if (pLong && pLat) {
+            *pLong = '\0';
+            strncpy(web_pins[web_pin_cnt].name, token, 127);
+            web_pins[web_pin_cnt].lon = atof(pLong + 6);
+            web_pins[web_pin_cnt].lat = atof(pLat + 5);
+            *pLong = ':';
+            web_pin_cnt++;
+        } else {
+            char pin_name[128] = "";
+            char search_token[128] = "";
+            char* colon = strchr(token, ':');
+            
+            if (colon) {
+                int name_len = colon - token;
+                if (name_len > 127) name_len = 127;
+                strncpy(pin_name, token, name_len);
+                pin_name[name_len] = '\0';
+                colon++;
+                while (*colon == ' ') colon++;
+                strncpy(search_token, colon, 127);
+            } else {
+                strncpy(pin_name, token, 127);
+                strncpy(search_token, token, 127);
+            }
+
+            double t_lat = 0, t_lon = 0;
+            char* comma = strchr(search_token, ',');
+            bool is_coord = false;
+            if (comma) {
+                char* endptr;
+                t_lat = strtod(search_token, &endptr);
+                if (endptr != search_token) {
+                    while (*endptr == ' ') endptr++;
+                    if (endptr == comma) {
+                        char* endptr2;
+                        t_lon = strtod(comma + 1, &endptr2);
+                        if (endptr2 != comma + 1) {
+                            is_coord = true;
+                        }
+                    }
+                }
+            }
+
+            if (is_coord) {
+                strncpy(web_pins[web_pin_cnt].name, pin_name, 127);
+                web_pins[web_pin_cnt].lat = t_lat;
+                web_pins[web_pin_cnt].lon = t_lon;
+                web_pin_cnt++;
+            } else {
+                char pc_token[128];
+                int pc_idx = 0;
+                for (int i = 0; search_token[i]; i++) {
+                    if (search_token[i] != ' ') pc_token[pc_idx++] = search_token[i];
+                }
+                pc_token[pc_idx] = '\0';
+
+                double found_lon = 0, found_lat = 0;
+                bool found = false;
+                EnterCriticalSection(&g_FileCS);
+                for (uint32_t i = 0; i < g_SearchItemCount; i++) {
+                    SearchItem* item = &g_SearchItems[i];
+                    if (item->pcode) {
+                        char item_pc[128];
+                        int idx = 0;
+                        for (int j = 0; item->pcode[j]; j++) {
+                            if (item->pcode[j] != ' ') item_pc[idx++] = item->pcode[j];
+                        }
+                        item_pc[idx] = '\0';
+                        if (strcasecmp(item_pc, pc_token) == 0) {
+                            found_lon = item->lon;
+                            found_lat = item->lat;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && item->name && strcasecmp(item->name, search_token) == 0) {
+                        found_lon = item->lon;
+                        found_lat = item->lat;
+                        found = true;
+                        break;
+                    }
+                }
+                LeaveCriticalSection(&g_FileCS);
+
+                if (found) {
+                    strncpy(web_pins[web_pin_cnt].name, pin_name, 127);
+                    web_pins[web_pin_cnt].lon = found_lon;
+                    web_pins[web_pin_cnt].lat = found_lat;
+                    web_pin_cnt++;
+                }
+            }
+        }
+        token = strtok(NULL, "|");
+    }
+
+    size_t j_cap = 1024 * 1024;
+    char* json = (char*)malloc(j_cap);
+    int jlen = snprintf(json, j_cap, "{");
+
+    jlen += snprintf(json + jlen, j_cap - jlen, "\"pins\":[");
+    for (int i = 0; i < web_pin_cnt; i++) {
+        char escaped[256] = {0}; int k = 0;
+        for (int m = 0; web_pins[i].name[m] && k < 250; m++) {
+            if (web_pins[i].name[m] == '"') escaped[k++] = '\\';
+            escaped[k++] = web_pins[i].name[m];
+        }
+        jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"name\":\"%s\",\"lon\":%.6f,\"lat\":%.6f}",
+            (i > 0 ? "," : ""), escaped, web_pins[i].lon, web_pins[i].lat);
+    }
+    jlen += snprintf(json + jlen, j_cap - jlen, "]");
+
+    if (do_route && web_pin_cnt >= 2) {
+        MapPoint* route_path = NULL; int route_path_cnt = 0;
+        RouteStep* route_steps = NULL; int route_step_cnt = 0;
+        double total_dist = 0.0; bool use_miles = false;
+
+        CalculateRouteForPins(web_pins, web_pin_cnt, 0, &route_path, &route_path_cnt, &route_steps, &route_step_cnt, &total_dist, &use_miles);
+
+        jlen += snprintf(json + jlen, j_cap - jlen, ",\"totalDist\":%.2f,\"useMiles\":%s,\"steps\":[", total_dist, use_miles ? "true" : "false");
+        for (int i = 0; i < route_step_cnt; i++) {
+            if (jlen + 512 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
+            char escaped[256] = {0}; int k = 0;
+            for (int m = 0; route_steps[i].text[m] && k < 250; m++) {
+                if (route_steps[i].text[m] == '"') escaped[k++] = '\\';
+                escaped[k++] = route_steps[i].text[m];
+            }
+            jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"text\":\"%s\",\"dist\":%.2f}",
+                (i > 0 ? "," : ""), escaped, route_steps[i].dist);
+        }
+        
+        if (jlen + 128 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
+        jlen += snprintf(json + jlen, j_cap - jlen, "],\"path\":[");
+        for (int i = 0; i < route_path_cnt; i++) {
+            if (jlen + 128 >= (int)j_cap) { j_cap *= 2; json = (char*)realloc(json, j_cap); }
+            jlen += snprintf(json + jlen, j_cap - jlen, "%s{\"lon\":%.6f,\"lat\":%.6f}",
+                (i > 0 ? "," : ""), route_path[i].lon, route_path[i].lat);
+        }
+        jlen += snprintf(json + jlen, j_cap - jlen, "]");
+
+        if (route_path) free(route_path);
+        if (route_steps) free(route_steps);
+    }
+    
+    jlen += snprintf(json + jlen, j_cap - jlen, "}");
+    SendHttpResponse(s, "application/json", json, jlen, NULL);
+    free(json);
+}
 static DWORD WINAPI ClientWorkerThread(LPVOID lpParam) {
     SOCKET client = (SOCKET)(uintptr_t)lpParam;
     char req[4096] = {0};

@@ -1151,6 +1151,9 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
             : (coast_cnt / 2 + coast_cnt - (seed_step + 1) / 2) % coast_cnt;
 
         if (coasts[i].merged || coasts[i].count < 2) continue;
+        
+        // FIX: Skip O(N^2) geometric stitching for unclosed water/parks
+        if (coasts[i].fc != CLASS_COASTLINE && coasts[i].fc != CLASS_LAND) continue;
 
         bool grew = true;
         while (grew) {
@@ -1241,6 +1244,10 @@ static void AssembleAndCloseCoastlinesOutward(AccumWay* coasts, uint32_t coast_c
         bridged = false;
         for (uint32_t i = 0; i < coast_cnt; i++) {
             if (coasts[i].merged || coasts[i].count < 2) continue;
+            
+            // FIX: Skip O(N^2) bridge chaining for unclosed water/parks
+            if (coasts[i].fc != CLASS_COASTLINE && coasts[i].fc != CLASS_LAND) continue;
+
             WayNode iS = coasts[i].nodes[0], iE = coasts[i].nodes[coasts[i].count - 1];
             if ((iS.lon - iE.lon) * (iS.lon - iE.lon) + (iS.lat - iE.lat) * (iS.lat - iE.lat) < 1e-8) continue;
 
@@ -2086,6 +2093,22 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (fways_resolved) fclose(fways_resolved);
                         if (res_buf) free(res_buf);
 
+                        // Ensure partially resolved features are not discarded by appending them
+                        FILE* f_rem = fopen(current_ways, "rb");
+                        FILE* f_res = fopen(ways_resolved_name, "ab");
+                        if (f_rem && f_res) {
+                            char* append_buf = malloc(65536);
+                            if (append_buf) {
+                                size_t bytes;
+                                while ((bytes = fread(append_buf, 1, 65536, f_rem)) > 0) {
+                                    fwrite(append_buf, 1, bytes, f_res);
+                                }
+                                free(append_buf);
+                            }
+                        }
+                        if (f_rem) fclose(f_rem);
+                        if (f_res) fclose(f_res);
+
                         current_ways = ways_resolved_name;
                     }
 
@@ -2112,11 +2135,17 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         if (!wnodes) { if (name) free(name); if (pcode) free(pcode); break; }
                         if (fread(wnodes, sizeof(WayNode), ref_count, fways) != ref_count) { if (name) free(name); if (pcode) free(pcode); free(wnodes); break; }
 
-                        bool valid = true;
-                        
-                        for (uint32_t i = 0; i < ref_count; i++) { if (wnodes[i].id != 0xFFFFFFFFFFFFFFFFULL) { valid = false; break; } }
+                        // Filter out unresolved nodes instead of dropping the entire feature
+                        uint32_t valid_cnt = 0;
+                        for (uint32_t i = 0; i < ref_count; i++) {
+                            if (wnodes[i].id == 0xFFFFFFFFFFFFFFFFULL) {
+                                wnodes[valid_cnt++] = wnodes[i];
+                            }
+                        }
 
-                        if (valid && ref_count >= 2) {
+                        if (valid_cnt >= 2) {
+                            ref_count = valid_cnt;
+
                             if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
                                 if (qjm_pass == 1) {
                                     for (uint32_t s_idx = 0; s_idx < ref_count; s_idx += 50) {
@@ -2295,12 +2324,10 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         
                         uint8_t out_fc = (coasts[i].fc == CLASS_COASTLINE) ? CLASS_LAND : coasts[i].fc;
 
-                        // Check if the geometry is genuinely closed
                         double dx = coasts[i].nodes[0].lon - coasts[i].nodes[coasts[i].count - 1].lon;
                         double dy = coasts[i].nodes[0].lat - coasts[i].nodes[coasts[i].count - 1].lat;
                         bool is_closed = (fabs(dx) < 1e-6 && fabs(dy) < 1e-6);
 
-                        // If it's an unclosed water/park feature (like a river), write it as a line
                         bool is_area = true;
                         if ((out_fc == CLASS_WATER || out_fc == CLASS_PARK) && !is_closed) {
                             is_area = false;
@@ -2326,7 +2353,6 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     }
                 }
 
-                // Ensure EOF_MARKER is written so subsequent runs can resume cleanly
                 fwrite(&EOF_MARKER, 4, 1, f_raw);
                 fclose(f_raw); f_raw = fopen(raw_tmp_name, "rb");
             }

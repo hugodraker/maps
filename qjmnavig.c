@@ -104,6 +104,8 @@ static int g_LoadedFileCount = 0;
 static bool g_InteractiveCanvas = false;
 static int g_AllocCanvasW = 0, g_AllocCanvasH = 0;
 
+static WNDPROC OldSearchEditProc = NULL;
+
 typedef struct { uint32_t id; float lon; float lat; } SNode;
 typedef struct {
     char maps_str[4096];
@@ -126,6 +128,7 @@ typedef struct {
 static void CalculateRoute(void);
 static void UpdateLegendWindow(HWND hwndMain);
 static void FinishPinEdit(HWND hwndParent);
+char g_PendingCliCommand[4096] = {0};
 
 static uint8_t* EnsureChunkEditable(int c_idx);
 static bool IsChunkActiveForAreas(uint32_t c_idx, double zoom);
@@ -338,6 +341,200 @@ static bool IsChunkActiveForAreas(uint32_t c_idx, double zoom) {
     return !mc->is_overview;
 }
 
+static void ProcessInputString(HWND hwnd, const char* input) {
+    if (!input || !input[0]) return;
+    
+    bool do_route = true;
+    const char* start = input;
+    if (strncmp(start, "plot:", 5) == 0) {
+        do_route = false;
+        start += 5;
+    } else if (strncmp(start, "route:", 6) == 0) {
+        do_route = true;
+        start += 6;
+    } else if (strncmp(start, "pins=", 5) == 0) {
+        start += 5;
+    }
+    
+    char buf[8192];
+    strncpy(buf, start, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    
+    for (int i = (int)strlen(buf) - 1; i >= 0; i--) {
+        if (buf[i] == '\r' || buf[i] == '\n' || buf[i] == ' ') buf[i] = '\0';
+        else break;
+    }
+
+    int new_pins_start = g_PinCount;
+    int added_pins = 0;
+
+    char* token = strtok(buf, "|");
+    while (token && g_PinCount < 1000) {
+        while (*token == ' ') token++;
+        
+        char* pLong = strstr(token, ":long:");
+        char* pLat = strstr(token, ":lat:");
+        if (pLong && pLat) {
+            *pLong = '\0';
+            strncpy(g_Pins[g_PinCount].name, token, 127);
+            g_Pins[g_PinCount].lon = atof(pLong + 6);
+            g_Pins[g_PinCount].lat = atof(pLat + 5);
+            *pLong = ':'; 
+            g_PinCount++;
+            added_pins++;
+        } else {
+            char pin_name[128] = "";
+            char search_token[128] = "";
+            char* colon = strchr(token, ':');
+            
+            if (colon) {
+                int name_len = colon - token;
+                if (name_len > 127) name_len = 127;
+                strncpy(pin_name, token, name_len);
+                pin_name[name_len] = '\0';
+                colon++;
+                while (*colon == ' ') colon++;
+                strncpy(search_token, colon, 127);
+            } else {
+                strncpy(pin_name, token, 127);
+                strncpy(search_token, token, 127);
+            }
+
+            double t_lat = 0, t_lon = 0;
+            char* comma = strchr(search_token, ',');
+            bool is_coord = false;
+            if (comma) {
+                char* endptr;
+                t_lat = strtod(search_token, &endptr);
+                if (endptr != search_token) {
+                    while (*endptr == ' ') endptr++;
+                    if (endptr == comma) {
+                        char* endptr2;
+                        t_lon = strtod(comma + 1, &endptr2);
+                        if (endptr2 != comma + 1) {
+                            is_coord = true;
+                        }
+                    }
+                }
+            }
+
+            if (is_coord) {
+                strncpy(g_Pins[g_PinCount].name, pin_name, 127);
+                g_Pins[g_PinCount].lat = t_lat;
+                g_Pins[g_PinCount].lon = t_lon;
+                g_PinCount++;
+                added_pins++;
+            } else {
+                char pc_token[128];
+                int pc_idx = 0;
+                for (int i = 0; search_token[i]; i++) {
+                    if (search_token[i] != ' ') pc_token[pc_idx++] = search_token[i];
+                }
+                pc_token[pc_idx] = '\0';
+
+                double found_lon = 0, found_lat = 0;
+                bool found = false;
+                EnterCriticalSection(&g_FileCS);
+                for (uint32_t i = 0; i < g_SearchItemCount; i++) {
+                    SearchItem* item = &g_SearchItems[i];
+                    if (g_SearchPostcodes && item->pcode) {
+                        char item_pc[128];
+                        int idx = 0;
+                        for (int j = 0; item->pcode[j]; j++) {
+                            if (item->pcode[j] != ' ') item_pc[idx++] = item->pcode[j];
+                        }
+                        item_pc[idx] = '\0';
+                        if (strcasecmp(item_pc, pc_token) == 0) {
+                            found_lon = item->lon;
+                            found_lat = item->lat;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && g_SearchRoads && item->name && strcasecmp(item->name, search_token) == 0) {
+                        found_lon = item->lon;
+                        found_lat = item->lat;
+                        found = true;
+                        break;
+                    }
+                }
+                LeaveCriticalSection(&g_FileCS);
+
+                if (found) {
+                    strncpy(g_Pins[g_PinCount].name, pin_name, 127);
+                    g_Pins[g_PinCount].lon = found_lon;
+                    g_Pins[g_PinCount].lat = found_lat;
+                    g_PinCount++;
+                    added_pins++;
+                }
+            }
+        }
+        token = strtok(NULL, "|");
+    }
+
+    if (added_pins > 0) {
+        g_SelectedPinCount = 0;
+        if (do_route && added_pins >= 2) {
+            for (int i = 0; i < added_pins; i++) {
+                g_SelectedPins[g_SelectedPinCount++] = new_pins_start + i;
+            }
+            CalculateRoute();
+            CopyRouteDistanceToClipboard(input);
+        } else {
+            if (g_RoutePath) { free(g_RoutePath); g_RoutePath = NULL; }
+            if (g_RouteSteps) { free(g_RouteSteps); g_RouteSteps = NULL; }
+            g_RouteStepCount = 0; g_RoutePathCount = 0; g_TotalRouteDist = 0.0;
+            ShowWindow(hBtnCancel, SW_HIDE); ShowWindow(hCboRouteType, SW_HIDE);
+            UpdateLegendWindow(hwnd);
+            
+            if (OpenClipboard(NULL)) {
+                EmptyClipboard();
+                char out_str[4096] = "Plotted Points:\n";
+                int offset = strlen(out_str);
+                for (int i = 0; i < added_pins && offset < 4000; i++) {
+                    offset += snprintf(out_str + offset, sizeof(out_str) - offset, "%s: %.6f, %.6f\n", 
+                        g_Pins[new_pins_start + i].name, g_Pins[new_pins_start + i].lat, g_Pins[new_pins_start + i].lon);
+                }
+                HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, strlen(out_str) + 1);
+                if (hGlob) {
+                    char* pMem = (char*)GlobalLock(hGlob);
+                    strcpy(pMem, out_str);
+                    GlobalUnlock(hGlob);
+                    SetClipboardData(CF_TEXT, hGlob);
+                }
+                CloseClipboard();
+            }
+        }
+
+        double min_lon = 180, max_lon = -180, min_lat = 90, max_lat = -90;
+        for (int i = 0; i < added_pins; i++) {
+            int idx = new_pins_start + i;
+            if (g_Pins[idx].lon < min_lon) min_lon = g_Pins[idx].lon;
+            if (g_Pins[idx].lon > max_lon) max_lon = g_Pins[idx].lon;
+            if (g_Pins[idx].lat < min_lat) min_lat = g_Pins[idx].lat;
+            if (g_Pins[idx].lat > max_lat) max_lat = g_Pins[idx].lat;
+        }
+        g_CenterLon = (min_lon + max_lon) / 2.0;
+        g_CenterLat = (min_lat + max_lat) / 2.0;
+
+        RECT rect; GetClientRect(hwnd, &rect);
+        double width = (rect.right > 40) ? rect.right - 40 : rect.right;
+        double height = (rect.bottom > 40) ? rect.bottom - 40 : rect.bottom;
+
+        if (max_lon - min_lon < 0.0001 || max_lat - min_lat < 0.0001) g_Zoom = 25000.0;
+        else {
+            double zoomX = width / (max_lon - min_lon);
+            double zoomY = height / (max_lat - min_lat);
+            g_Zoom = (zoomX < zoomY) ? zoomX : zoomY;
+            g_Zoom *= 0.85;
+        }
+        g_PanX = 0; g_PanY = 0; g_Rotation = 0;
+        g_CanvasDirty = true;
+        InvalidateRect(hwnd, NULL, FALSE);
+        UpdateWindow(hwnd);
+    }
+}
+
 static bool PointInPolygonPts(const float* pts, uint32_t pt_cnt, double lon, double lat) {
     if (pt_cnt < 3) return false;
     bool inside = false;
@@ -525,6 +722,41 @@ static inline void NavLatLonToScreen(double lon, double lat, int w, int h, doubl
 static inline void NavLatLonToCanvasScreen(double lon, double lat, int w, int h, double* px, double* py) {
     NavLatLonToScreen(lon, lat, w, h, g_PanX, g_PanY, g_Zoom, px, py);
 }
+static LRESULT CALLBACK SearchEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_DOWN || wParam == VK_UP) {
+            if (IsWindowVisible(hListSearch)) {
+                int count = SendMessage(hListSearch, LB_GETCOUNT, 0, 0);
+                if (count > 0) {
+                    int sel = SendMessage(hListSearch, LB_GETCURSEL, 0, 0);
+                    if (wParam == VK_DOWN) sel++;
+                    else sel--;
+                    if (sel < 0) sel = count - 1;
+                    if (sel >= count) sel = 0;
+                    SendMessage(hListSearch, LB_SETCURSEL, sel, 0);
+                    return 0; 
+                }
+            }
+        } else if (wParam == VK_RETURN) {
+            if (IsWindowVisible(hListSearch)) {
+                int sel = SendMessage(hListSearch, LB_GETCURSEL, 0, 0);
+                if (sel != LB_ERR) {
+                    SendMessage(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(1003, LBN_SELCHANGE), (LPARAM)hListSearch);
+                    return 0; 
+                }
+            }
+        } else if (wParam == VK_ESCAPE) {
+            if (IsWindowVisible(hListSearch)) {
+                ShowWindow(hListSearch, SW_HIDE);
+                return 0;
+            }
+        }
+    } else if (msg == WM_GETDLGCODE) {
+        if (wParam == VK_RETURN) return DLGC_WANTALLKEYS;
+    }
+    return CallWindowProc(OldSearchEditProc, hwnd, msg, wParam, lParam);
+}
+
 static int SanitizeMapLabel(const char* raw, uint32_t max_rem, char* out, uint32_t out_cap) {
     if (!raw || max_rem == 0 || out_cap < 2) return 0;
     uint32_t limit = (max_rem < out_cap - 1) ? max_rem : (out_cap - 1);
@@ -1551,203 +1783,211 @@ static void DrawMap(HDC hdc, int w, int h, double pan_x, double pan_y) {
     DeleteObject(coastPen); DeleteObject(hwyMinorPen); DeleteObject(hwyMainPen); DeleteObject(landBrush); DeleteObject(parkBrush); DeleteObject(waterBrush);
 }
 
-static void DrawOverlay(HDC hdc, int w, int h) {
-    if (g_HighlightedChunk != -1 && g_HighlightedFeat != -1 && (uint32_t)g_HighlightedChunk < g_ChunkCount) {
+void DrawOverlay(HDC hdc, int w, int h) {
+    if (g_HighlightedChunk != -1) {
         uint8_t* data = GetChunkData(g_HighlightedChunk);
         if (data) {
-            uint32_t uncomp_sz = g_Chunks[g_HighlightedChunk].uncomp_size;
-            uint32_t f_cnt = *(uint32_t*)data;
-            uint32_t p_cnt = *(uint32_t*)(data + 4);
-            uint32_t s_len = *(uint32_t*)(data + 8);
-            uint32_t geom_end = 12 + f_cnt * sizeof(PFeat) + p_cnt * sizeof(float);
-            if (geom_end >= uncomp_sz) s_len = 0;
-            else if (geom_end + s_len > uncomp_sz) s_len = uncomp_sz - geom_end;
-
-            if ((uint32_t)g_HighlightedFeat < f_cnt) {
-                PFeat* feats = (PFeat*)(data + 12);
-                float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
-                char* strings = (char*)((uint8_t*)points + p_cnt * sizeof(float));
-                PFeat* f = &feats[g_HighlightedFeat];
-
-                HPEN hlPen = CreatePen(PS_SOLID, g_EditMode ? 3 : 6, RGB(255, 50, 50));
-                SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                SelectObject(hdc, hlPen);
-
-                POINT* poly_pts = malloc((f->pt_cnt + 1) * sizeof(POINT));
-                int* orig_idx = malloc((f->pt_cnt + 1) * sizeof(int));
-
-                uint32_t draw_cnt = 0;
-                int best_seg_draw_idx = 0;
-                double best_len = -1.0;
-
-                double half_cw = w * 0.5 + g_PanX;
-                double half_ch = h * 0.5 + g_PanY;
-                double off_x = half_cw - g_CenterLon * g_Zoom;
-                double off_y = half_ch + g_CenterLat * g_Zoom;
-
-                bool has_rot = (fabs(g_Rotation) > 1e-6);
-                double cos_r = has_rot ? cos(g_Rotation) : 1.0;
-                double sin_r = has_rot ? sin(g_Rotation) : 0.0;
-
-                int last_px = -999999, last_py = -999999;
-
-                for (uint32_t j = 0; j < f->pt_cnt; j++) {
-                    float lon = points[f->pt_off + j*2];
-                    float lat = points[f->pt_off + j*2 + 1];
-
-                    double px, py;
-                    if (has_rot) {
-                        double dx = (lon - g_CenterLon) * g_Zoom;
-                        double dy = (g_CenterLat - lat) * g_Zoom;
-                        px = half_cw + dx * cos_r - dy * sin_r;
-                        py = half_ch + dx * sin_r + dy * cos_r;
-                    } else {
-                        px = lon * g_Zoom + off_x;
-                        py = lat * (-g_Zoom) + off_y;
-                    }
-
-                    if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
-                    if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
-
-                    int sx = (int)px, sy = (int)py;
-                    bool is_sel = (g_EditMode && ((int)j == g_SelectedNode || (int)j == g_SelectedNode2));
-
-                    if (j == 0 || j == f->pt_cnt - 1 || is_sel || abs(sx - last_px) >= 2 || abs(sy - last_py) >= 2) {
-                        poly_pts[draw_cnt].x = sx;
-                        poly_pts[draw_cnt].y = sy;
-                        orig_idx[draw_cnt] = (int)j;
-
-                        if (draw_cnt > 0) {
-                            double dx = poly_pts[draw_cnt].x - poly_pts[draw_cnt-1].x;
-                            double dy = poly_pts[draw_cnt].y - poly_pts[draw_cnt-1].y;
-                            double l = dx*dx + dy*dy;
-                            if (l > best_len && poly_pts[draw_cnt].x >= 0 && poly_pts[draw_cnt].x <= w && poly_pts[draw_cnt].y >= 0 && poly_pts[draw_cnt].y <= h) {
-                                best_len = l; best_seg_draw_idx = draw_cnt - 1;
-                            }
-                        }
-
-                        draw_cnt++;
-                        last_px = sx;
-                        last_py = sy;
-                    }
-                }
-
-                if (f->is_area && f->pt_cnt >= 3) {
-                    poly_pts[draw_cnt] = poly_pts[0];
-                    draw_cnt++;
-                }
-
-                if (draw_cnt >= 2) Polyline(hdc, poly_pts, draw_cnt);
-                DeleteObject(hlPen);
-
-                char clean_label[64] = {0};
-                const char* label = NULL;
-                if (f->name_off > 0 && f->name_off < s_len &&
-                    SanitizeMapLabel(strings + f->name_off, s_len - f->name_off, clean_label, sizeof(clean_label)) > 0) {
-                    label = clean_label;
-                } else if (f->fc == CLASS_HWY_MAIN) {
-                    label = "Main Highway";
-                } else if (f->fc == CLASS_HWY_MINOR) {
-                    label = "Local Road";
-                }
-
-                if (label && label[0] && draw_cnt >= 2) {
-                    int p1x = poly_pts[best_seg_draw_idx].x, p1y = poly_pts[best_seg_draw_idx].y;
-                    int p2x = poly_pts[best_seg_draw_idx+1].x, p2y = poly_pts[best_seg_draw_idx+1].y;
-                    double angle_deg = atan2(p1y - p2y, p2x - p1x) * 180.0 / 3.1415926535;
-                    if (angle_deg < 0) angle_deg += 360.0;
-                    if (angle_deg > 90.0 && angle_deg < 270.0) angle_deg -= 180.0;
-                    int cx = (p1x + p2x) / 2, cy = (p1y + p2y) / 2;
-
-                    HFONT hFont = CreateFont(18, 0, (int)(angle_deg * 10), (int)(angle_deg * 10), FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
-                    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
-                    SetBkMode(hdc, TRANSPARENT);
-                    SetTextAlign(hdc, TA_CENTER | TA_BASELINE);
-                    SetTextColor(hdc, RGB(255, 255, 255));
-                    int lbl_len = (int)strlen(label);
-                    for (int ox = -1; ox <= 1; ox++) for (int oy = -1; oy <= 1; oy++) if (ox || oy) TextOutA(hdc, cx + ox, cy - 6 + oy, label, lbl_len);
-                    SetTextColor(hdc, RGB(180, 0, 0));
-                    TextOutA(hdc, cx, cy - 6, label, lbl_len);
-                    SelectObject(hdc, hOldFont);
-                    DeleteObject(hFont);
-                }
-
-                if (g_EditMode) {
-                    HPEN nPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
-                    HBRUSH nBrush = CreateSolidBrush(RGB(255, 255, 255));
-                    HBRUSH selBrush = CreateSolidBrush(RGB(255, 220, 0));
-                    HBRUSH sel2Brush = CreateSolidBrush(RGB(0, 220, 255));
-                    SelectObject(hdc, nPen);
-
-                    for (uint32_t k = 0; k < draw_cnt; k++) {
-                        int sx = poly_pts[k].x;
-                        int sy = poly_pts[k].y;
-                        if (sx < -10 || sx > w + 10 || sy < -10 || sy > h + 10) continue;
-
-                        int orig_j = orig_idx[k];
-                        bool is_sel1 = (orig_j == g_SelectedNode);
-                        bool is_sel2 = (orig_j == g_SelectedNode2);
-                        SelectObject(hdc, is_sel1 ? selBrush : (is_sel2 ? sel2Brush : nBrush));
-                        int r = (is_sel1 || is_sel2) ? 5 : 4;
-                        Rectangle(hdc, sx - r, sy - r, sx + r, sy + r);
-                    }
-
-                    DeleteObject(nPen); DeleteObject(nBrush); DeleteObject(selBrush); DeleteObject(sel2Brush);
-                }
-                free(poly_pts);
-                free(orig_idx);
+            PFeat* feats = (PFeat*)(data + 12);
+            float* points = (float*)(data + 12 + (*(uint32_t*)data) * sizeof(PFeat));
+            PFeat* f = &feats[g_HighlightedFeat];
+            
+            HPEN hlPen = CreatePen(PS_SOLID, 8, RGB(255, 50, 50));
+            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            SelectObject(hdc, hlPen);
+            
+            POINT* pts = malloc(f->pt_cnt * sizeof(POINT));
+            for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                double px, py;
+                LatLonToScreen(points[f->pt_off + j*2], points[f->pt_off + j*2 + 1], w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
+                pts[j].x = (LONG)px;
+                pts[j].y = (LONG)py;
             }
+            
+            Polyline(hdc, pts, f->pt_cnt);
+            free(pts);
+            DeleteObject(hlPen);
         }
     }
 
     if (g_RoutePathCount > 0) {
         LOGBRUSH lbRoute = { BS_SOLID, c_Route, 0 };
         HPEN routePen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, 6, &lbRoute, 0, NULL);
+        
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
         SelectObject(hdc, routePen);
+        
         POINT* screen_pts = malloc(g_RoutePathCount * sizeof(POINT));
-        int pt_out = 0, last_rx = -999999, last_ry = -999999;
         for (int i = 0; i < g_RoutePathCount; i++) {
-            double px, py; NavLatLonToScreen(g_RoutePath[i].lon, g_RoutePath[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
-            if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
-            if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
-            int sx = (int)px, sy = (int)py;
-            if (i == 0 || i == g_RoutePathCount - 1 || abs(sx - last_rx) >= 2 || abs(sy - last_ry) >= 2) {
-                screen_pts[pt_out].x = sx; screen_pts[pt_out].y = sy;
-                pt_out++; last_rx = sx; last_ry = sy;
-            }
+            double px, py;
+            LatLonToScreen(g_RoutePath[i].lon, g_RoutePath[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
+            screen_pts[i].x = (LONG)px;
+            screen_pts[i].y = (LONG)py;
         }
-        if (pt_out >= 2) Polyline(hdc, screen_pts, pt_out);
+        
+        Polyline(hdc, screen_pts, g_RoutePathCount);
+        
+        if (g_RouteStepCount > 0) {
+            SetTextColor(hdc, RGB(40, 10, 80));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextAlign(hdc, TA_CENTER | TA_BOTTOM);
+            HFONT hBoldFont = CreateFont(15, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+            HFONT hOldF = (HFONT)SelectObject(hdc, hBoldFont);
+
+            int step_idx = 0;
+            double accum_path_dist = 0;
+            double next_target = g_RouteSteps[0].dist / 2.0;
+            
+            for (int i = 0; i < g_RoutePathCount - 1 && step_idx < g_RouteStepCount; i++) {
+                double km = Haversine(g_RoutePath[i].lat, g_RoutePath[i].lon, g_RoutePath[i+1].lat, g_RoutePath[i+1].lon);
+                double d_val = g_UseMiles ? (km * 0.621371) : km;
+                accum_path_dist += d_val;
+                
+                if (accum_path_dist >= next_target) {
+                    TextOutA(hdc, screen_pts[i].x, screen_pts[i].y - 8, g_RouteSteps[step_idx].text, strlen(g_RouteSteps[step_idx].text));
+                    next_target += g_RouteSteps[step_idx].dist / 2.0; 
+                    step_idx++;
+                    if (step_idx < g_RouteStepCount) {
+                        next_target += g_RouteSteps[step_idx].dist / 2.0;
+                    }
+                }
+            }
+            SelectObject(hdc, hOldF);
+            DeleteObject(hBoldFont);
+        }
+
         free(screen_pts);
         DeleteObject(routePen);
     }
 
-    HBRUSH brPin = CreateSolidBrush(c_Pin), brPinSel = CreateSolidBrush(c_PinSel);
-    HPEN pinPen = CreatePen(PS_SOLID, 1, RGB(100, 0, 0)), pinSelPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 100));
+    HBRUSH brPin = CreateSolidBrush(c_Pin);
+    HBRUSH brPinSel = CreateSolidBrush(c_PinSel);
+    HPEN pinPen = CreatePen(PS_SOLID, 1, RGB(100, 0, 0));
+    HPEN pinSelPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 100));
 
     for (int i = 0; i < g_PinCount; i++) {
-        double px, py; NavLatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
-        if (px < -32000) px = -32000; else if (px > 32000) px = 32000;
-        if (py < -32000) py = -32000; else if (py > 32000) py = 32000;
+        double px, py;
+        LatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, w, h, g_PanX, g_PanY, g_Zoom, &px, &py);
         int x = (int)px, y = (int)py;
+        
         bool selected = false;
-        for (int k = 0; k < g_SelectedPinCount; k++) { if (g_SelectedPins[k] == i) selected = true; }
+        for(int k=0; k<g_SelectedPinCount; k++) {
+            if(g_SelectedPins[k] == i) {
+                selected = true;
+            }
+        }
 
         SelectObject(hdc, selected ? brPinSel : brPin);
         SelectObject(hdc, selected ? pinSelPen : pinPen);
+        
         POINT pt[4] = {{x, y}, {x - 10, y - 20}, {x, y - 30}, {x + 10, y - 20}};
         Polygon(hdc, pt, 4);
 
         if (i != g_EditingPinIndex && strlen(g_Pins[i].name) > 0) {
-            SetTextColor(hdc, RGB(20, 20, 20)); SetBkMode(hdc, TRANSPARENT); SetTextAlign(hdc, TA_CENTER | TA_BOTTOM);
+            SetTextColor(hdc, RGB(20, 20, 20));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextAlign(hdc, TA_CENTER | TA_BOTTOM);
             TextOutA(hdc, x, y - 32, g_Pins[i].name, strlen(g_Pins[i].name));
         }
     }
-    DeleteObject(brPin); DeleteObject(pinPen); DeleteObject(brPinSel); DeleteObject(pinSelPen);
+    
+    DeleteObject(brPin);
+    DeleteObject(pinPen);
+    DeleteObject(brPinSel);
+    DeleteObject(pinSelPen);
+
+    if (g_SelectedPinCount >= 2 && g_RouteStepCount > 0) {
+        int leg_w = 260;
+        int max_leg_h = h - 100;
+        if (max_leg_h < 100) {
+            max_leg_h = 100;
+        }
+        
+        int req_h = 40 + (g_RouteStepCount * 20);
+        int leg_h = (req_h < max_leg_h) ? req_h : max_leg_h;
+        
+        RECT legRect = { 10, 45, 10 + leg_w, 45 + leg_h };
+        HBRUSH legBrush = CreateSolidBrush(RGB(250, 248, 245));
+        HPEN legPen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+        
+        SelectObject(hdc, legBrush);
+        SelectObject(hdc, legPen);
+        RoundRect(hdc, legRect.left, legRect.top, legRect.right, legRect.bottom, 15, 15);
+
+        if (req_h > max_leg_h) {
+            g_LegendMaxScroll = (float)(req_h - max_leg_h + 10);
+            if (g_LegendScrollY < -g_LegendMaxScroll) {
+                g_LegendScrollY = -g_LegendMaxScroll;
+            }
+        } else {
+            g_LegendMaxScroll = 0;
+            g_LegendScrollY = 0;
+        }
+
+        if (g_LegendMaxScroll > 0) {
+            HBRUSH sbBg = CreateSolidBrush(RGB(230, 230, 230));
+            HBRUSH sbFg = CreateSolidBrush(RGB(180, 180, 180));
+            RECT sbTrack = { legRect.right - 12, legRect.top + 10, legRect.right - 4, legRect.bottom - 10 };
+            FillRect(hdc, &sbTrack, sbBg);
+            
+            float visible_ratio = (float)leg_h / (float)req_h;
+            int thumb_h = (int)((leg_h - 20) * visible_ratio);
+            if (thumb_h < 20) {
+                thumb_h = 20;
+            }
+            
+            float scroll_ratio = -g_LegendScrollY / g_LegendMaxScroll;
+            int thumb_y = sbTrack.top + (int)(scroll_ratio * (sbTrack.bottom - sbTrack.top - thumb_h));
+            
+            RECT sbThumb = { sbTrack.left, thumb_y, sbTrack.right, thumb_y + thumb_h };
+            FillRect(hdc, &sbThumb, sbFg);
+            
+            DeleteObject(sbBg);
+            DeleteObject(sbFg);
+        }
+
+        HRGN clipRgn = CreateRectRgn(legRect.left + 5, legRect.top + 5, legRect.right - (g_LegendMaxScroll > 0 ? 15 : 5), legRect.bottom - 5);
+        SelectClipRgn(hdc, clipRgn);
+        SetTextColor(hdc, RGB(30, 30, 30));
+        SetTextAlign(hdc, TA_LEFT | TA_TOP);
+        
+        HFONT hBoldFont = CreateFont(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Arial");
+        HFONT hOldF = (HFONT)SelectObject(hdc, hBoldFont);
+
+        char hdr[128];
+        snprintf(hdr, sizeof(hdr), "Total Distance: %.1f %s", g_TotalRouteDist, g_UseMiles ? "mi" : "km");
+        TextOutA(hdc, 20, 55 + (int)g_LegendScrollY, hdr, strlen(hdr));
+        
+        SelectObject(hdc, hOldF);
+        DeleteObject(hBoldFont);
+
+        float text_y = 80 + g_LegendScrollY;
+        for (int step = 0; step < g_RouteStepCount; step++) {
+            if (text_y > 40 && text_y < legRect.bottom) {
+                char step_str[300];
+                snprintf(step_str, sizeof(step_str), "%d. %s (%.1f %s)", step+1, g_RouteSteps[step].text, g_RouteSteps[step].dist, g_UseMiles ? "mi" : "km");
+                TextOutA(hdc, 20, (int)text_y, step_str, strlen(step_str));
+            }
+            text_y += 20;
+        }
+        
+        SelectClipRgn(hdc, NULL);
+        DeleteObject(clipRgn);
+        DeleteObject(legBrush);
+        DeleteObject(legPen);
+    }
 }
 
 static void UpdateLegendWindow(HWND hwndMain) {
-    if (!hLegend || !hwndMain) return;
+    if (!hwndMain) return;
+
+    if (g_RoutePathCount > 0) {
+        SetWindowTextA(hwndMain, g_EditMode ? "QJM Map Navigator [EDIT MODE] - Routed" : "QJM Map Navigator - Routed");
+    } else {
+        SetWindowTextA(hwndMain, g_EditMode ? "QJM Map Navigator [EDIT MODE]" : "QJM Map Navigator");
+    }
+
+    if (!hLegend) return;
+
     if (g_SelectedPinCount >= 2 && g_RouteStepCount > 0) {
         RECT rc; GetClientRect(hwndMain, &rc);
         int leg_w = 260;
@@ -1765,7 +2005,7 @@ static void UpdateLegendWindow(HWND hwndMain) {
             g_LegendScrollY = 0.0f;
         }
 
-        SetWindowPos(hLegend, HWND_TOP, 10, 80, leg_w, leg_h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        SetWindowPos(hLegend, NULL, 10, 80, leg_w, leg_h, SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOZORDER);
         InvalidateRect(hLegend, NULL, FALSE);
     } else {
         ShowWindow(hLegend, SW_HIDE);
@@ -2314,35 +2554,176 @@ static void CalculateRouteForPins(
     }
     LeaveCriticalSection(&g_FileCS);
 }
-static void CalculateRoute(void) {
-    if (g_RoutePath) { free(g_RoutePath); g_RoutePath = NULL; }
-    if (g_RouteSteps) { free(g_RouteSteps); g_RouteSteps = NULL; }
-    g_RouteStepCount = 0; g_RoutePathCount = 0; g_TotalRouteDist = 0.0; g_LegendScrollY = 0.0f;
-
+void CalculateRoute() {
+    if (g_RoutePath) free(g_RoutePath);
+    g_RoutePath = NULL;
+    g_RouteStepCount = 0;
+    g_RoutePathCount = 0;
+    g_TotalRouteDist = 0.0;
+    g_LegendScrollY = 0.0f;
+    
     if (g_SelectedPinCount < 2) {
-        ShowWindow(hBtnCancel, SW_HIDE); ShowWindow(hCboRouteType, SW_HIDE);
-        if (g_hMainWnd) UpdateLegendWindow(g_hMainWnd);
+        ShowWindow(hBtnCancel, SW_HIDE);
+        ShowWindow(hCboRouteType, SW_HIDE);
         return;
     }
 
-    MapPin* sel_pins = malloc(g_SelectedPinCount * sizeof(MapPin));
-    if (!sel_pins) return;
-    for (int i = 0; i < g_SelectedPinCount; i++) {
-        sel_pins[i] = g_Pins[g_SelectedPins[i]];
+    char sys_measure[2] = "0";
+    GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_IMEASURE, sys_measure, 2);
+    g_UseMiles = (sys_measure[0] == '1'); 
+
+    for (int p = 0; p < g_SelectedPinCount - 1; p++) {
+        MapPin* pA = &g_Pins[g_SelectedPins[p]];
+        MapPin* pB = &g_Pins[g_SelectedPins[p+1]];
+
+        double dist_km = Haversine(pA->lat, pA->lon, pB->lat, pB->lon);
+        g_TotalRouteDist += g_UseMiles ? (dist_km * 0.621371) : dist_km;
+
+        g_RoutePath = realloc(g_RoutePath, (g_RoutePathCount + 1) * sizeof(MapPoint));
+        g_RoutePath[g_RoutePathCount].lon = pA->lon;
+        g_RoutePath[g_RoutePathCount].lat = pA->lat;
+        g_RoutePathCount++;
+
+        int steps = (int)(dist_km * 50.0) + 20;
+        double dx = pB->lon - pA->lon;
+        double dy = pB->lat - pA->lat;
+        
+        int last_chunk = -1;
+        int last_feat = -1;
+        int last_pt = -1;
+        double last_x = 0; 
+        double last_y = 0;
+        char last_road[128] = "";
+        double accum_dist = 0;
+
+        for (int s = 0; s <= steps; s++) {
+            double slon = pA->lon + dx * (s / (double)steps);
+            double slat = pA->lat + dy * (s / (double)steps);
+
+            double min_d = 999999;
+            char best_road[128] = "Unnamed Road";
+            int best_chunk = -1;
+            int best_feat = -1;
+            int best_pt = -1;
+
+            for (uint32_t c = 0; c < g_ChunkCount; c++) {
+                MapChunk* mc = &g_Chunks[c];
+                if (slon < mc->min_lon - 0.02 || slon > mc->max_lon + 0.02 || slat < mc->min_lat - 0.02 || slat > mc->max_lat + 0.02) {
+                    continue;
+                }
+
+                uint8_t* data = GetChunkData(c);
+                if (!data) continue;
+                
+                uint32_t f_cnt = *(uint32_t*)data;
+                PFeat* feats = (PFeat*)(data + 12);
+                float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
+                char* strings = (char*)((uint8_t*)points + (*(uint32_t*)(data+4)) * sizeof(float));
+                
+                for (uint32_t i = 0; i < f_cnt; i++) {
+                    PFeat* f = &feats[i];
+                    if (f->fc != CLASS_HWY_MAIN && f->fc != CLASS_HWY_MINOR) continue;
+                    if (slon < f->min_lon - 0.02 || slon > f->max_lon + 0.02 || slat < f->min_lat - 0.02 || slat > f->max_lat + 0.02) continue;
+
+                    for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                        double px = points[f->pt_off + j*2];
+                        double py = points[f->pt_off + j*2 + 1];
+                        double ddx = px - slon;
+                        double ddy = py - slat;
+                        double d = ddx*ddx + ddy*ddy;
+                        
+                        if (g_RouteMode == 0 && f->fc == CLASS_HWY_MAIN) d *= 0.005;
+                        
+                        if (last_chunk != -1) {
+                            if (c == (uint32_t)last_chunk && i == (uint32_t)last_feat) {
+                                d *= 0.0001; 
+                            } else {
+                                double tdx = px - last_x;
+                                double tdy = py - last_y;
+                                if (tdx*tdx + tdy*tdy < 0.00000001) {
+                                    d *= 0.0001; 
+                                } else if (f->name_off && strlen(last_road) > 0 && strcmp(strings + f->name_off, last_road) == 0) {
+                                    d *= 0.001; 
+                                }
+                            }
+                        } else if (f->name_off && strlen(last_road) > 0 && strcmp(strings + f->name_off, last_road) == 0) {
+                            d *= 0.001; 
+                        }
+
+                        if (d < min_d) {
+                            min_d = d;
+                            best_chunk = c;
+                            best_feat = i;
+                            best_pt = j;
+                            if (f->name_off) {
+                                strcpy(best_road, strings + f->name_off);
+                            } else {
+                                strcpy(best_road, (f->fc == CLASS_HWY_MAIN) ? "Main Highway" : "Local Road");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (best_chunk != -1) {
+                uint8_t* b_data = GetChunkData(best_chunk);
+                PFeat* b_feats = (PFeat*)(b_data + 12);
+                float* b_points = (float*)(b_data + 12 + (*(uint32_t*)b_data) * sizeof(PFeat));
+                PFeat* b_f = &b_feats[best_feat];
+
+                if (best_chunk == last_chunk && best_feat == last_feat && best_pt != last_pt && last_pt != -1) {
+                    int step_dir = (best_pt > last_pt) ? 1 : -1;
+                    for (int k = last_pt + step_dir; k != best_pt; k += step_dir) {
+                        g_RoutePath = realloc(g_RoutePath, (g_RoutePathCount + 1) * sizeof(MapPoint));
+                        g_RoutePath[g_RoutePathCount].lon = b_points[b_f->pt_off + k*2];
+                        g_RoutePath[g_RoutePathCount].lat = b_points[b_f->pt_off + k*2 + 1];
+                        g_RoutePathCount++;
+                    }
+                }
+                
+                if (best_chunk != last_chunk || best_feat != last_feat || best_pt != last_pt) {
+                    g_RoutePath = realloc(g_RoutePath, (g_RoutePathCount + 1) * sizeof(MapPoint));
+                    g_RoutePath[g_RoutePathCount].lon = b_points[b_f->pt_off + best_pt*2];
+                    g_RoutePath[g_RoutePathCount].lat = b_points[b_f->pt_off + best_pt*2 + 1];
+                    g_RoutePathCount++;
+                }
+                last_chunk = best_chunk;
+                last_feat = best_feat;
+                last_pt = best_pt;
+                last_x = b_points[b_f->pt_off + best_pt*2];
+                last_y = b_points[b_f->pt_off + best_pt*2 + 1];
+            }
+
+            double step_len = dist_km / steps;
+            if (strcmp(best_road, last_road) != 0) {
+                if (strlen(last_road) > 0) {
+                    g_RouteSteps = realloc(g_RouteSteps, (g_RouteStepCount + 1) * sizeof(RouteStep));
+                    snprintf(g_RouteSteps[g_RouteStepCount].text, 256, "Take %.128s", last_road);
+                    g_RouteSteps[g_RouteStepCount].dist = accum_dist;
+                    g_RouteStepCount++;
+                }
+                strcpy(last_road, best_road);
+                accum_dist = step_len;
+            } else {
+                accum_dist += step_len;
+            }
+        }
+        if (accum_dist > 0) {
+            g_RouteSteps = realloc(g_RouteSteps, (g_RouteStepCount + 1) * sizeof(RouteStep));
+            snprintf(g_RouteSteps[g_RouteStepCount].text, 256, "Take %.128s", last_road);
+            g_RouteSteps[g_RouteStepCount].dist = accum_dist;
+            g_RouteStepCount++;
+        }
+
+        g_RoutePath = realloc(g_RoutePath, (g_RoutePathCount + 1) * sizeof(MapPoint));
+        g_RoutePath[g_RoutePathCount].lon = pB->lon;
+        g_RoutePath[g_RoutePathCount].lat = pB->lat;
+        g_RoutePathCount++;
     }
-
-    CalculateRouteForPins(
-        sel_pins, g_SelectedPinCount, g_RouteMode,
-        &g_RoutePath, &g_RoutePathCount,
-        &g_RouteSteps, &g_RouteStepCount,
-        &g_TotalRouteDist, &g_UseMiles
-    );
-    free(sel_pins);
-
     if (g_RoutePathCount > 0) {
-        ShowWindow(hBtnCancel, SW_SHOW); ShowWindow(hCboRouteType, SW_SHOW);
+        ShowWindow(hBtnCancel, SW_SHOW);
+        ShowWindow(hCboRouteType, SW_SHOW);
     }
-    if (g_hMainWnd) UpdateLegendWindow(g_hMainWnd);
 }
 
 static DWORD WINAPI BackgroundLoadMapsThread(LPVOID lpParam) {
@@ -2362,6 +2743,11 @@ static DWORD WINAPI BackgroundLoadMapsThread(LPVOID lpParam) {
         g_IsLoading = false;
         g_CanvasDirty = true;
         InvalidateRect(g_hMainWnd, NULL, FALSE);
+        
+        // Execute pending CLI arguments once maps are successfully loaded
+        if (g_PendingCliCommand[0] != '\0') {
+            PostMessage(g_hMainWnd, WM_APP + 1, 0, 0);
+        }
     }
     return 0;
 }
@@ -2408,11 +2794,27 @@ static void FinishPinEdit(HWND hwndParent) {
 static void PopulateSearchList(HWND hwnd) {
     char query[128]; GetWindowTextA(hTxtSearch, query, 128); SendMessage(hListSearch, LB_RESETCONTENT, 0, 0);
     if (strlen(query) < 2) { ShowWindow(hListSearch, SW_HIDE); return; }
+    
+    char query_pc[128];
+    int qp_idx = 0;
+    for (int i = 0; query[i]; i++) {
+        if (query[i] != ' ') query_pc[qp_idx++] = query[i];
+    }
+    query_pc[qp_idx] = '\0';
+
     int count = 0;
     for (uint32_t i = 0; i < g_SearchItemCount && count < 50; i++) {
         SearchItem* item = &g_SearchItems[i]; bool match = false;
         if (g_SearchRoads && item->name && FindSubStringIC(item->name, query)) match = true;
-        if (!match && g_SearchPostcodes && item->pcode && FindSubStringIC(item->pcode, query)) match = true;
+        if (!match && g_SearchPostcodes && item->pcode) {
+            char item_pc[128];
+            int idx = 0;
+            for (int j = 0; item->pcode[j]; j++) {
+                if (item->pcode[j] != ' ') item_pc[idx++] = item->pcode[j];
+            }
+            item_pc[idx] = '\0';
+            if (FindSubStringIC(item_pc, query_pc)) match = true;
+        }
         if (match) {
             char display[512]; snprintf(display, 512, "%s %s", item->name ? item->name : "", item->pcode ? item->pcode : "");
             int idx = SendMessageA(hListSearch, LB_ADDSTRING, 0, (LPARAM)display); SendMessageA(hListSearch, LB_SETITEMDATA, idx, (LPARAM)i); count++;
@@ -2450,6 +2852,512 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return CallWindowProc(OldEditProc, hwnd, msg, wParam, lParam);
 }
 
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            DragAcceptFiles(hwnd, TRUE);
+            HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            RegisterHotKey(hwnd, 1, MOD_CONTROL, 'P');
+            
+            hTxtSearch = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 10, 10, 180, 25, hwnd, (HMENU)1004, NULL, NULL);
+            hBtnSearchOpts = CreateWindowA("BUTTON", "..", WS_CHILD | WS_VISIBLE, 195, 10, 25, 25, hwnd, (HMENU)1005, NULL, NULL);
+            
+            hListSearch = CreateWindowExA(WS_EX_TOPMOST, "LISTBOX", "", WS_CHILD | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)1003, NULL, NULL);
+            hBtnCancel = CreateWindowA("BUTTON", "Cancel Route", WS_CHILD | WS_VISIBLE, 230, 10, 90, 25, hwnd, (HMENU)4, NULL, NULL);
+            hCboRouteType = CreateWindowA("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VISIBLE | WS_CHILD, 325, 12, 110, 100, hwnd, (HMENU)5, NULL, NULL);
+            
+            SendMessage(hCboRouteType, CB_ADDSTRING, 0, (LPARAM)"Fastest Route");
+            SendMessage(hCboRouteType, CB_ADDSTRING, 0, (LPARAM)"Shortest Route");
+            SendMessage(hCboRouteType, CB_SETCURSEL, g_RouteMode, 0);
+            
+            ShowWindow(hBtnCancel, SW_HIDE);
+            ShowWindow(hCboRouteType, SW_HIDE);
+            
+            SendMessage(hTxtSearch, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hBtnSearchOpts, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(hCboRouteType, WM_SETFONT, (WPARAM)hFont, TRUE);
+            return 0;
+        }
+        case WM_HOTKEY: {
+            if (wParam == 1 && hPdfDlg) {
+                ShowWindow(hPdfDlg, SW_SHOW);
+                SetForegroundWindow(hPdfDlg);
+            }
+            return 0;
+        }
+        case WM_TIMER: {
+            if (wParam == 1) {
+                KillTimer(hwnd, 1);
+                PopulateSearchList(hwnd);
+            }
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == 1004 && HIWORD(wParam) == EN_CHANGE) {
+                SetTimer(hwnd, 1, 500, NULL);
+            } else if (LOWORD(wParam) == 1005) {
+                HMENU hSearchMenu = CreatePopupMenu();
+                AppendMenuA(hSearchMenu, MF_STRING | (g_SearchRoads ? MF_CHECKED : MF_UNCHECKED), 1001, "Road Names");
+                AppendMenuA(hSearchMenu, MF_STRING | (g_SearchPostcodes ? MF_CHECKED : MF_UNCHECKED), 1002, "Postal Codes");
+                RECT r; 
+                GetWindowRect(hBtnSearchOpts, &r);
+                TrackPopupMenu(hSearchMenu, TPM_RIGHTBUTTON, r.left, r.bottom, 0, hwnd, NULL);
+                DestroyMenu(hSearchMenu);
+            } else if (LOWORD(wParam) == 1001) {
+                g_SearchRoads = !g_SearchRoads;
+                PopulateSearchList(hwnd);
+            } else if (LOWORD(wParam) == 1002) {
+                g_SearchPostcodes = !g_SearchPostcodes;
+                PopulateSearchList(hwnd);
+            } else if (LOWORD(wParam) == 4) {
+                g_SelectedPinCount = 0;
+                g_RouteStepCount = 0;
+                g_RoutePathCount = 0;
+                ShowWindow(hBtnCancel, SW_HIDE);
+                ShowWindow(hCboRouteType, SW_HIDE);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (LOWORD(wParam) == 5 && HIWORD(wParam) == CBN_SELCHANGE) {
+                g_RouteMode = SendMessage(hCboRouteType, CB_GETCURSEL, 0, 0);
+                CalculateRoute();
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (LOWORD(wParam) == 1003 && HIWORD(wParam) == LBN_SELCHANGE) {
+                int sel = SendMessage(hListSearch, LB_GETCURSEL, 0, 0);
+                if (sel != LB_ERR) {
+                    uint64_t idx = SendMessage(hListSearch, LB_GETITEMDATA, sel, 0);
+                    SearchItem* item = &g_SearchItems[idx];
+                    g_HighlightedChunk = item->chunk_idx;
+                    g_HighlightedFeat = item->feat_idx;
+                    g_CenterLon = item->lon;
+                    g_CenterLat = item->lat;
+                    g_Zoom = 25000.0;
+                    g_PanX = 0;
+                    g_PanY = 0;
+                    
+                    if (item->pcode && g_PinCount < 1000) {
+                        snprintf(g_Pins[g_PinCount].name, sizeof(g_Pins[g_PinCount].name), "%s", item->pcode);
+                        g_Pins[g_PinCount].lon = item->lon;
+                        g_Pins[g_PinCount].lat = item->lat;
+                        g_PinCount++;
+                    }
+                    
+                    ShowWindow(hListSearch, SW_HIDE);
+                    SetFocus(hwnd);
+                    g_CanvasDirty = true;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
+            break;
+        }
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            char path[MAX_PATH];
+            DragQueryFileA(hDrop, 0, path, MAX_PATH);
+            DragFinish(hDrop);
+            
+            if (strlen(g_MapFilesStr) + strlen(path) + 2 < sizeof(g_MapFilesStr)) {
+                if (strlen(g_MapFilesStr) > 0) {
+                    strcat(g_MapFilesStr, "|");
+                }
+                strcat(g_MapFilesStr, path);
+            }
+            char* ext = strrchr(path, '.');
+            if (ext && (strcasecmp(ext, ".qjm") == 0 || strcasecmp(ext, ".qjmc") == 0)) {
+                LoadQJMData(path);
+            }
+            AutoFitMap(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        case WM_SIZE: {
+            AutoFitMap(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wParam == 'P' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (hPdfDlg) {
+                    ShowWindow(hPdfDlg, SW_SHOW);
+                    SetForegroundWindow(hPdfDlg);
+                }
+                return 0;
+            }
+            if (wParam == VK_SPACE) {
+                g_AutoFit = true;
+                AutoFitMap(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_ESCAPE) {
+                g_SelectedPinCount = 0;
+                g_RouteStepCount = 0;
+                g_RoutePathCount = 0;
+                ShowWindow(hBtnCancel, SW_HIDE);
+                ShowWindow(hCboRouteType, SW_HIDE);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_RBUTTONDOWN: {
+            if (hEditPin) {
+                SetFocus(hwnd);
+                return 0;
+            }
+            int mx = (short)LOWORD(lParam);
+            int my = (short)HIWORD(lParam);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            
+            bool pin_deleted = false;
+            for (int i = 0; i < g_PinCount; i++) {
+                double px, py;
+                LatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
+                if (abs(mx - (int)px) < 15 && (my - (int)py) > -35 && (my - (int)py) < 5) {
+                    int sel_idx = -1;
+                    for (int k = 0; k < g_SelectedPinCount; k++) {
+                        if (g_SelectedPins[k] == i) {
+                            sel_idx = k;
+                        }
+                    }
+                    if (sel_idx >= 0) {
+                        for (int k = sel_idx; k < g_SelectedPinCount - 1; k++) {
+                            g_SelectedPins[k] = g_SelectedPins[k+1];
+                        }
+                        g_SelectedPinCount--;
+                    }
+                    for (int k = 0; k < g_SelectedPinCount; k++) {
+                        if (g_SelectedPins[k] > i) {
+                            g_SelectedPins[k]--;
+                        }
+                    }
+                    for (int k = i; k < g_PinCount - 1; k++) {
+                        g_Pins[k] = g_Pins[k+1];
+                    }
+                    g_PinCount--;
+                    pin_deleted = true;
+                    if (g_SelectedPinCount >= 2) {
+                        CalculateRoute();
+                    } else {
+                        g_RouteStepCount = 0;
+                        g_RoutePathCount = 0;
+                        ShowWindow(hBtnCancel, SW_HIDE);
+                        ShowWindow(hCboRouteType, SW_HIDE);
+                    }
+                    break;
+                }
+            }
+            if (!pin_deleted) {
+                double c_lon, c_lat;
+                ScreenToLatLon(mx, my, rc.right, rc.bottom, &c_lon, &c_lat);
+                double best_d = 999999;
+                int best_chunk = -1;
+                int best_feat = -1;
+                
+                for (uint32_t c = 0; c < g_ChunkCount; c++) {
+                    MapChunk* mc = &g_Chunks[c];
+                    if (c_lon < mc->min_lon - 0.05 || c_lon > mc->max_lon + 0.05 || c_lat < mc->min_lat - 0.05 || c_lat > mc->max_lat + 0.05) continue;
+                    uint8_t* data = GetChunkData(c);
+                    if (!data) continue;
+                    
+                    uint32_t f_cnt = *(uint32_t*)data;
+                    PFeat* feats = (PFeat*)(data + 12);
+                    float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
+                    
+                    for (uint32_t i = 0; i < f_cnt; i++) {
+                        PFeat* f = &feats[i];
+                        if (c_lon < f->min_lon - 0.05 || c_lon > f->max_lon + 0.05 || c_lat < f->min_lat - 0.05 || c_lat > f->max_lat + 0.05) continue;
+                        for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                            double ddx = points[f->pt_off + j*2] - c_lon;
+                            double ddy = points[f->pt_off + j*2 + 1] - c_lat;
+                            double d = ddx*ddx + ddy*ddy;
+                            if (d < best_d) {
+                                best_d = d;
+                                best_chunk = c;
+                                best_feat = i;
+                            }
+                        }
+                    }
+                }
+                if (best_chunk != -1) {
+                    uint8_t* data = GetChunkData(best_chunk);
+                    PFeat* best_f = &((PFeat*)(data + 12))[best_feat];
+                    double feat_w = best_f->max_lon - best_f->min_lon;
+                    double feat_h = best_f->max_lat - best_f->min_lat;
+                    if (feat_w < 0.0001) feat_w = 0.0001;
+                    if (feat_h < 0.0001) feat_h = 0.0001;
+                    
+                    g_CenterLon = (best_f->min_lon + best_f->max_lon) / 2.0;
+                    g_CenterLat = (best_f->min_lat + best_f->max_lat) / 2.0;
+                    g_PanX = 0;
+                    g_PanY = 0;
+                    
+                    double zoomX = rc.right / (1.2 * feat_w);
+                    double zoomY = rc.bottom / (1.2 * feat_h);
+                    g_Zoom = (zoomX < zoomY) ? zoomX : zoomY;
+                    
+                    g_HighlightedChunk = best_chunk;
+                    g_HighlightedFeat = best_feat;
+                    g_CanvasDirty = true;
+                } else {
+                    g_HighlightedChunk = -1;
+                    g_HighlightedFeat = -1;
+                    g_CanvasDirty = true;
+                }
+                g_SelectedPinCount = 0;
+                g_RouteStepCount = 0;
+                g_RoutePathCount = 0;
+                ShowWindow(hBtnCancel, SW_HIDE);
+                ShowWindow(hCboRouteType, SW_HIDE);
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            int mx = (short)LOWORD(lParam); 
+            if (g_SelectedPinCount >= 2 && mx < 300) {
+                float scroll_delta = ((int16_t)HIWORD(wParam) > 0) ? 30.0f : -30.0f;
+                g_LegendScrollY += scroll_delta;
+                if (g_LegendScrollY > 0) g_LegendScrollY = 0;
+                if (g_LegendMaxScroll > 0 && g_LegendScrollY < -g_LegendMaxScroll) {
+                    g_LegendScrollY = -g_LegendMaxScroll;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int my = (short)HIWORD(lParam);
+            ScreenToClient(hwnd, &(POINT){mx, my});
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            double zoom_factor = (delta > 0) ? 1.2 : 0.8333333;
+            double rel_x = mx - (rect.right / 2.0);
+            double rel_y = my - (rect.bottom / 2.0);
+            g_PanX = rel_x - (rel_x - g_PanX) * zoom_factor;
+            g_PanY = rel_y - (rel_y - g_PanY) * zoom_factor;
+            g_Zoom *= zoom_factor;
+            if (g_Zoom < 0.001) g_Zoom = 0.001; 
+            g_CanvasDirty = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+            SetFocus(hwnd);
+            if (hEditPin) SetFocus(hwnd); 
+            g_IsDragging = true;
+            g_MouseMoved = false;
+            g_LastMousePos.x = (short)LOWORD(lParam);
+            g_LastMousePos.y = (short)HIWORD(lParam);
+            g_HighlightedChunk = -1;
+            g_HighlightedFeat = -1;
+            ShowWindow(hListSearch, SW_HIDE);
+            SetCapture(hwnd);
+            g_CanvasDirty = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        case WM_MOUSEMOVE:
+            if (g_IsDragging) {
+                int mx = (short)LOWORD(lParam);
+                int my = (short)HIWORD(lParam);
+                if (abs(mx - g_LastMousePos.x) > 3 || abs(my - g_LastMousePos.y) > 3) {
+                    g_MouseMoved = true;
+                }
+                if (g_MouseMoved) {
+                    int dx = mx - g_LastMousePos.x;
+                    int dy = my - g_LastMousePos.y;
+                    if (wParam & MK_SHIFT) {
+                        g_Rotation += dx * 0.01;
+                    } else {
+                        g_PanX += dx;
+                        g_PanY += dy;
+                    }
+                    g_LastMousePos.x = mx;
+                    g_LastMousePos.y = my;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_IsDragging) {
+                g_IsDragging = false;
+                ReleaseCapture();
+                if (!g_MouseMoved && hEditPin == NULL) {
+                    int mx = (short)LOWORD(lParam);
+                    int my = (short)HIWORD(lParam);
+                    RECT rect;
+                    GetClientRect(hwnd, &rect);
+                    for (int i = 0; i < g_PinCount; i++) {
+                        double px, py;
+                        LatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rect.right, rect.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
+                        if (abs(mx - (int)px) < 15 && (my - (int)py) > -35 && (my - (int)py) < 5) { 
+                            bool already_sel = false;
+                            for(int k=0; k<g_SelectedPinCount; k++) {
+                                if(g_SelectedPins[k] == i) {
+                                    already_sel = true;
+                                }
+                            }
+                            if (!already_sel && g_SelectedPinCount < 1000) {
+                                g_SelectedPins[g_SelectedPinCount++] = i;
+                                CalculateRoute();
+                            }
+                            InvalidateRect(hwnd, NULL, FALSE);
+                            break; 
+                        }
+                    }
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONDBLCLK: {
+            int mx = (short)LOWORD(lParam);
+            int my = (short)HIWORD(lParam);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            bool hit_pin = false;
+            for (int i = 0; i < g_PinCount; i++) {
+                double px, py;
+                LatLonToScreen(g_Pins[i].lon, g_Pins[i].lat, rc.right, rc.bottom, g_PanX, g_PanY, g_Zoom, &px, &py);
+                if (abs(mx - (int)px) < 15 && (my - (int)py) > -35 && (my - (int)py) < 5) {
+                    g_EditingPinIndex = i;
+                    hEditPin = CreateWindowExA(0, "EDIT", g_Pins[i].name, WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, (int)px - 50, (int)py - 55, 100, 20, hwnd, (HMENU)99, NULL, NULL);
+                    OldEditProc = (WNDPROC)SetWindowLongPtr(hEditPin, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+                    SetFocus(hEditPin);
+                    SendMessage(hEditPin, EM_SETSEL, 0, -1);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    hit_pin = true;
+                    break;
+                }
+            }
+            if (!hit_pin && g_PinCount < 1000) {
+                if (my < 45 || (g_SelectedPinCount >= 2 && mx < 280)) {
+                    return 0;
+                }
+                g_EditingPinIndex = g_PinCount;
+                double t_lon, t_lat;
+                ScreenToLatLon(mx, my, rc.right, rc.bottom, &t_lon, &t_lat);
+                double snap_dist = 999999;
+                for (uint32_t c = 0; c < g_ChunkCount; c++) {
+                    MapChunk* mc = &g_Chunks[c];
+                    if (t_lon < mc->min_lon - 0.02 || t_lon > mc->max_lon + 0.02 || t_lat < mc->min_lat - 0.02 || t_lat > mc->max_lat + 0.02) continue;
+                    uint8_t* data = GetChunkData(c);
+                    if (!data) continue;
+                    uint32_t f_cnt = *(uint32_t*)data;
+                    PFeat* feats = (PFeat*)(data + 12);
+                    float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
+                    for (uint32_t i = 0; i < f_cnt; i++) {
+                        PFeat* f = &feats[i];
+                        if (f->fc != CLASS_HWY_MAIN && f->fc != CLASS_HWY_MINOR) continue;
+                        if (f->fc == CLASS_HWY_MINOR && g_Zoom < 2500.0) continue; 
+                        if (t_lon < f->min_lon - 0.02 || t_lon > f->max_lon + 0.02 || t_lat < f->min_lat - 0.02 || t_lat > f->max_lat + 0.02) continue;
+                        for (uint32_t j = 0; j < f->pt_cnt; j++) {
+                            double ddx = points[f->pt_off + j*2] - t_lon;
+                            double ddy = points[f->pt_off + j*2 + 1] - t_lat;
+                            double d = ddx*ddx + ddy*ddy;
+                            if (d < snap_dist) {
+                                snap_dist = d;
+                                g_Pins[g_PinCount].lon = points[f->pt_off + j*2];
+                                g_Pins[g_PinCount].lat = points[f->pt_off + j*2 + 1];
+                            }
+                        }
+                    }
+                }
+                if (snap_dist == 999999) {
+                    g_Pins[g_PinCount].lon = t_lon;
+                    g_Pins[g_PinCount].lat = t_lat;
+                }
+                snprintf(g_Pins[g_PinCount].name, 128, "%d", g_PinCount + 1);
+                g_SelectedPins[g_SelectedPinCount++] = g_PinCount++;
+                if (g_SelectedPinCount >= 2) CalculateRoute();
+                double e_px, e_py;
+                LatLonToScreen(g_Pins[g_PinCount-1].lon, g_Pins[g_PinCount-1].lat, rc.right, rc.bottom, g_PanX, g_PanY, g_Zoom, &e_px, &e_py);
+                hEditPin = CreateWindowExA(0, "EDIT", g_Pins[g_PinCount-1].name, WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, (int)e_px - 50, (int)e_py - 55, 100, 20, hwnd, (HMENU)99, NULL, NULL);
+                OldEditProc = (WNDPROC)SetWindowLongPtr(hEditPin, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+                SetFocus(hEditPin);
+                SendMessage(hEditPin, EM_SETSEL, 0, -1);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int w = rc.right;
+            int h = rc.bottom;
+            if (g_CanvasW != w * 3 || g_CanvasH != h * 3 || g_Zoom != g_CanvasZoom || g_CanvasDirty) {
+                UpdateCanvas(hwnd);
+            }
+            int src_x = w - (int)(g_PanX - g_CanvasPanX);
+            int src_y = h - (int)(g_PanY - g_CanvasPanY);
+            if (src_x < w/2 || src_y < h/2 || src_x + w > g_CanvasW - w/2 || src_y + h > g_CanvasH - h/2) {
+                UpdateCanvas(hwnd);
+                src_x = w;
+                src_y = h;
+            }
+            BitBlt(hdc, 0, 0, w, h, g_hdcCanvas, src_x, src_y, SRCCOPY);
+            DrawOverlay(hdc, w, h);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_DESTROY:
+            UnregisterHotKey(hwnd, 1);
+            if (g_SavePins) {
+                FILE* ini = fopen("qjmnavig.ini", "w");
+                if (ini) {
+                    fprintf(ini, "panX=%.4f\npanY=%.4f\nzoom=%.4f\nrotation=%.6f\n", g_PanX, g_PanY, g_Zoom, g_Rotation);
+                    RECT wrect;
+                    GetWindowRect(hwnd, &wrect);
+                    fprintf(ini, "winX=%d\nwinY=%d\nwinW=%d\nwinH=%d\n", (int)wrect.left, (int)wrect.top, (int)(wrect.right - wrect.left), (int)(wrect.bottom - wrect.top));
+                    fprintf(ini, "pageW=%.2f\npageH=%.2f\nmargH=%.2f\nmargV=%.2f\nisLandscape=%d\n", page_w_mm, page_h_mm, g_MargH, g_MargV, isLandscape);
+                    fprintf(ini, "showLand=%d\nshowWater=%d\nshowPark=%d\nshowCoast=%d\nshowHwyMin=%d\nshowHwyMain=%d\nshowLabels=%d\n", g_ShowLand, g_ShowWater, g_ShowPark, g_ShowCoast, g_ShowHwyMin, g_ShowHwyMain, g_ShowLabels);
+                    fprintf(ini, "pdfLand=%d\npdfWater=%d\npdfPark=%d\npdfCoast=%d\npdfHwyMin=%d\npdfHwyMain=%d\npdfLabels=%d\n", g_PdfExpLand, g_PdfExpWater, g_PdfExpPark, g_PdfExpCoast, g_PdfExpHwyMin, g_PdfExpHwyMain, g_PdfExpLabels);
+                    fprintf(ini, "showDebug=%d\nrouteMode=%d\nsearchRoads=%d\nsearchPostcodes=%d\n", g_ShowDebug, g_RouteMode, g_SearchRoads, g_SearchPostcodes);
+                    
+                    char hex[16];
+                    ColorToHex(c_Land, hex);
+                    fprintf(ini, "colLand=%s\n", hex);
+                    ColorToHex(c_Water, hex);
+                    fprintf(ini, "colWater=%s\n", hex);
+                    ColorToHex(c_Park, hex);
+                    fprintf(ini, "colPark=%s\n", hex);
+                    ColorToHex(c_Coast, hex);
+                    fprintf(ini, "colCoast=%s\n", hex);
+                    ColorToHex(c_HwyMin, hex);
+                    fprintf(ini, "colHwyMin=%s\n", hex);
+                    ColorToHex(c_HwyMain, hex);
+                    fprintf(ini, "colHwyMain=%s\n", hex);
+                    ColorToHex(c_Pin, hex);
+                    fprintf(ini, "colPin=%s\n", hex);
+                    ColorToHex(c_PinSel, hex);
+                    fprintf(ini, "colPinSel=%s\n", hex);
+                    ColorToHex(c_Route, hex);
+                    fprintf(ini, "colRoute=%s\n", hex);
+                    
+                    if (g_PinCount > 0) {
+                        fprintf(ini, "pins=");
+                        for (int i=0; i<g_PinCount; i++) {
+                            fprintf(ini, "%s:long:%.7f:lat:%.7f|", g_Pins[i].name, g_Pins[i].lon, g_Pins[i].lat);
+                        }
+                        fprintf(ini, "\n");
+                    } else {
+                        fprintf(ini, "pins=\n");
+                    }
+                    
+                    char routeStr[8192] = "";
+                    for (int i = 0; i < g_SelectedPinCount; i++) {
+                        if (i > 0) {
+                            strcat(routeStr, "|");
+                        }
+                        if (strlen(routeStr) + strlen(g_Pins[g_SelectedPins[i]].name) < sizeof(routeStr)) {
+                            strcat(routeStr, g_Pins[g_SelectedPins[i]].name);
+                        }
+                    }
+                    fprintf(ini, "route=%s\nmaps=%s\n", routeStr, g_MapFilesStr);
+                    fclose(ini);
+                }
+            }
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
 static void ZoomToFeatureWithSurroundingArea(HWND hwnd, int c_idx, int f_idx) {
     if (c_idx < 0 || (uint32_t)c_idx >= g_ChunkCount || f_idx < 0) return;
     RECT rc; GetClientRect(hwnd, &rc);
@@ -2546,6 +3454,13 @@ static LRESULT CALLBACK PdfWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
 static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_APP + 1: {
+            if (g_PendingCliCommand[0] != '\0') {
+                ProcessInputString(hwnd, g_PendingCliCommand);
+                g_PendingCliCommand[0] = '\0';
+            }
+            return 0;
+        }
         case WM_ERASEBKGND:
             return 1;
         case WM_CREATE: {
@@ -2553,6 +3468,9 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             StartHttpServer();
             DragAcceptFiles(hwnd, TRUE); HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT); RegisterHotKey(hwnd, 1, MOD_CONTROL, 'P');
             hTxtSearch = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 10, 10, 190, 25, hwnd, (HMENU)1004, NULL, NULL);
+            
+            OldSearchEditProc = (WNDPROC)SetWindowLongPtr(hTxtSearch, GWLP_WNDPROC, (LONG_PTR)SearchEditSubclassProc);
+            
             hBtnSearchOpts = CreateWindowExA(WS_EX_CLIENTEDGE, "BUTTON", "..", WS_CHILD | WS_VISIBLE, 205, 10, 35, 25, hwnd, (HMENU)1005, NULL, NULL);
             hListSearch = CreateWindowExA(WS_EX_TOPMOST, "LISTBOX", "", WS_CHILD | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)1003, NULL, NULL);
             hBtnCancel = CreateWindowExA(WS_EX_CLIENTEDGE, "BUTTON", "Cancel Route", WS_CHILD | WS_VISIBLE, 10, 45, 100, 25, hwnd, (HMENU)4, NULL, NULL);
@@ -2625,6 +3543,14 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     uint64_t idx = SendMessage(hListSearch, LB_GETITEMDATA, sel, 0); SearchItem* item = &g_SearchItems[idx];
                     g_HighlightedChunk = item->chunk_idx; g_HighlightedFeat = item->feat_idx;
                     ShowWindow(hListSearch, SW_HIDE); SetFocus(hwnd);
+                    
+                    if (item->pcode && g_PinCount < 1000) {
+                        snprintf(g_Pins[g_PinCount].name, sizeof(g_Pins[g_PinCount].name), "%s", item->pcode);
+                        g_Pins[g_PinCount].lon = item->lon;
+                        g_Pins[g_PinCount].lat = item->lat;
+                        g_PinCount++;
+                    }
+
                     EnterCriticalSection(&g_FileCS);
                     ZoomToFeatureWithSurroundingArea(hwnd, item->chunk_idx, item->feat_idx);
                     LeaveCriticalSection(&g_FileCS);
@@ -2648,6 +3574,22 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         case WM_KEYDOWN: {
             if (hEditPin) FinishPinEdit(hwnd);
+            
+            if (wParam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (OpenClipboard(hwnd)) {
+                    HANDLE hData = GetClipboardData(CF_TEXT);
+                    if (hData) {
+                        char* text = (char*)GlobalLock(hData);
+                        if (text) {
+                            ProcessInputString(hwnd, text);
+                            GlobalUnlock(hData);
+                        }
+                    }
+                    CloseClipboard();
+                }
+                return 0;
+            }
+
             if (wParam == 'P' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 if (hPdfDlg) {
                     SyncPdfDialogOrientation();
@@ -3289,7 +4231,7 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                         float* points = (float*)(data + 12 + f_cnt * sizeof(PFeat));
                         PFeat* f = &feats[g_HighlightedFeat];
 
-                        double best_d2 = 256.0; // 16 pixels tolerance squared
+                        double best_d2 = 256.0;
                         int best_node = -1;
 
                         for (uint32_t j = 0; j < f->pt_cnt; j++) {
@@ -3404,8 +4346,10 @@ static LRESULT CALLBACK NavigWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_COPYDATA: {
             COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lParam;
             if (cds && cds->lpData) {
-                CopyRouteDistanceToClipboard((const char*)cds->lpData);
+                ProcessInputString(hwnd, (const char*)cds->lpData);
             }
+            if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
             return TRUE;
         }
         case WM_DESTROY:
@@ -3465,15 +4409,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "QjmNavigMutex_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (lpCmdLine && strlen(lpCmdLine) > 0) {
+            char* p = lpCmdLine;
+            while (*p == ' ') p++;
+            if (strncmp(p, "-e", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
+                p += 2; while (*p == ' ') p++;
+            }
+            
+            char cleanCmd[4096] = {0};
+            strncpy(cleanCmd, p, 4095);
+            if (cleanCmd[0] == '"') {
+                size_t len = strlen(cleanCmd);
+                if (cleanCmd[len-1] == '"') cleanCmd[len-1] = '\0';
+                memmove(cleanCmd, cleanCmd + 1, strlen(cleanCmd));
+            }
+
             HWND hwndExisting = FindWindowA("QjmnavigClass", NULL);
             if (hwndExisting) {
                 COPYDATASTRUCT cds;
                 cds.dwData = 1;
-                cds.cbData = (DWORD)(strlen(lpCmdLine) + 1);
-                cds.lpData = (void*)lpCmdLine;
+                cds.cbData = (DWORD)(strlen(cleanCmd) + 1);
+                cds.lpData = (void*)cleanCmd;
                 SendMessageA(hwndExisting, WM_COPYDATA, (WPARAM)NULL, (LPARAM)&cds);
             } else {
-                CopyRouteDistanceToClipboard(lpCmdLine);
+                CopyRouteDistanceToClipboard(cleanCmd);
             }
         }
         return 0;
@@ -3513,42 +4471,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         } fclose(ini);
     }
     
-    bool is_cli_route = (lpCmdLine && strstr(lpCmdLine, "long:") != NULL);
-
     if (lpCmdLine && strlen(lpCmdLine) > 0) {
         char* p = lpCmdLine;
         while (*p == ' ') p++;
         if (strncmp(p, "-e", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
             g_EditMode = true; p += 2; while (*p == ' ') p++;
         }
-        if (*p && !is_cli_route) {
-            char cleanCmd[4096] = {0}; strncpy(cleanCmd, p, 4095);
-            if (cleanCmd[0] == '"') {
-                size_t len = strlen(cleanCmd); if (cleanCmd[len-1] == '"') cleanCmd[len-1] = '\0'; memmove(cleanCmd, cleanCmd + 1, strlen(cleanCmd));
-            }
-            strcpy(initMaps, cleanCmd); strcpy(g_MapFilesStr, cleanCmd);
+        
+        char cleanCmd[4096] = {0}; 
+        strncpy(cleanCmd, p, 4095);
+        if (cleanCmd[0] == '"') {
+            size_t len = strlen(cleanCmd); 
+            if (cleanCmd[len-1] == '"') cleanCmd[len-1] = '\0'; 
+            memmove(cleanCmd, cleanCmd + 1, strlen(cleanCmd));
         }
-    }
 
-    // If invoked from CLI with pins=..., synchronously load maps and copy route without racing the background thread
-    if (is_cli_route) {
-        if (strlen(initMaps) > 0) {
-            char maps_copy[4096];
-            strncpy(maps_copy, initMaps, sizeof(maps_copy) - 1);
-            maps_copy[sizeof(maps_copy) - 1] = '\0';
-            char* token = strtok(maps_copy, "|");
-            while (token) {
-                char* ext = strrchr(token, '.');
-                if (ext && (strcasecmp(ext, ".qjm") == 0 || strcasecmp(ext, ".qjmc") == 0)) {
-                    LoadQJMData(token);
-                }
-                token = strtok(NULL, "|");
-            }
+        if (strstr(cleanCmd, "long:") != NULL || strncmp(cleanCmd, "plot:", 5) == 0 || strncmp(cleanCmd, "route:", 6) == 0 || (strchr(cleanCmd, '|') != NULL && !strstr(cleanCmd, ".qjm"))) {
+            strncpy(g_PendingCliCommand, cleanCmd, sizeof(g_PendingCliCommand) - 1);
+        } else if (cleanCmd[0]) {
+            strcpy(initMaps, cleanCmd); 
+            strcpy(g_MapFilesStr, cleanCmd);
         }
-        CopyRouteDistanceToClipboard(lpCmdLine);
-        DeleteCriticalSection(&g_FileCS);
-        ReleaseMutex(hMutex); CloseHandle(hMutex);
-        return 0;
     }
 
     WNDCLASSA wc = {0}; wc.lpfnWndProc = NavigWndProc; wc.hInstance = hInstance; wc.style = CS_DBLCLKS; wc.lpszClassName = "QjmnavigClass";
@@ -3579,6 +4522,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             args->maps_str[sizeof(args->maps_str) - 1] = '\0';
             CreateThread(NULL, 0, BackgroundLoadMapsThread, args, 0, NULL);
         }
+    } else if (g_PendingCliCommand[0] != '\0') {
+        PostMessage(hwnd, WM_APP + 1, 0, 0);
     }
 
     MSG msg = {0}; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
