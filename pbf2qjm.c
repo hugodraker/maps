@@ -19,6 +19,8 @@ double g_CenterLon = 0.0, g_CenterLat = 0.0, g_PanX = 0.0, g_PanY = 0.0, g_Zoom 
 #define IO_BUF_SIZE (1024 * 1024 * 4)
 #define MASK_RES 128
 #define CLIP_POLYGON_AABB_DEFINED
+#define FSEEK64 _fseeki64
+#define FTELL64 _ftelli64
 typedef struct { char inFile[MAX_PATH]; char outFile[MAX_PATH]; char refFile[MAX_PATH]; } ThreadArgs;
 
 typedef struct {
@@ -66,6 +68,44 @@ static HWND hTxtSimpLand, hTxtSimpCoast, hTxtSimpHwyMain, hTxtSimpHwyMin, hTxtSi
 static LRESULT CALLBACK CompilerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void ProjectToBBox(double lon, double lat, double min_x, double max_x, double min_y, double max_y, WayNode* out_node);
+static char* TrimCsvToken(char* s) {
+    if (!s) return s;
+    while (*s == ' ' || *s == '\t' || *s == '"') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '"' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        s[--len] = '\0';
+    }
+    return s;
+}
+
+static void AppendCsvPathToList(char* list_buf, size_t buf_size, const char* new_path) {
+    if (!new_path || !*new_path) return;
+    // Avoid adding exact duplicate file path if already in the list
+    char temp_copy[32768];
+    strncpy(temp_copy, list_buf, sizeof(temp_copy) - 1);
+    temp_copy[sizeof(temp_copy) - 1] = '\0';
+    char* cur = temp_copy;
+    while (cur && *cur) {
+        char* semi = strchr(cur, ';');
+        if (semi) *semi = '\0';
+        char* tok = TrimCsvToken(cur);
+        if (strcasecmp(tok, new_path) == 0) return;
+        cur = semi ? (semi + 1) : NULL;
+    }
+
+    size_t cur_len = strlen(list_buf);
+    while (cur_len > 0 && (list_buf[cur_len - 1] == ' ' || list_buf[cur_len - 1] == ';')) {
+        list_buf[--cur_len] = '\0';
+    }
+    if (cur_len > 0 && cur_len + 1 < buf_size) {
+        strcat(list_buf, ";");
+        cur_len++;
+    }
+    if (cur_len + strlen(new_path) + 1 < buf_size) {
+        strcat(list_buf, new_path);
+    }
+}
+
 static int CompareCsvPcode(const void* a, const void* b) {
     return strcmp(((CsvPcode*)a)->pcode, ((CsvPcode*)b)->pcode);
 }
@@ -102,6 +142,113 @@ static inline uint64_t GetFeatureDrawOrder(uint8_t fc) {
 
 static inline uint64_t EncodeLayeredMorton(uint8_t fc, int32_t x, int32_t y) {
     return (GetFeatureDrawOrder(fc) << 60) | (EncodeMorton(x, y) & 0x0FFFFFFFFFFFFFFFULL);
+}
+
+static bool IsDecimalCoordToken(const char* s, double* out_val) {
+    if (!s || !*s) return false;
+    if (!strchr(s, '.')) return false;
+    char* endptr = NULL;
+    double v = strtod(s, &endptr);
+    if (endptr == s) return false;
+    while (*endptr == ' ' || *endptr == '\t') endptr++;
+    if (*endptr != '\0') return false;
+    *out_val = v;
+    return true;
+}
+
+static bool IsValidLatLonPair(const char* s_lat, const char* s_lon, double* out_lat, double* out_lon) {
+    double lat = 0.0, lon = 0.0;
+    if (!IsDecimalCoordToken(s_lat, &lat) || !IsDecimalCoordToken(s_lon, &lon)) return false;
+    if (lat == 0.0 && lon == 0.0) return false;
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+    *out_lat = lat;
+    *out_lon = lon;
+    return true;
+}
+
+static bool IsTwoLetterCountry(const char* s) {
+    if (!s || strlen(s) != 2) return false;
+    char c0 = s[0], c1 = s[1];
+    bool a0 = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
+    bool a1 = (c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z');
+    return a0 && a1;
+}
+
+static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bool is_area, const char* name, const char* pcode, uint8_t fc, SortEntry** entries, uint64_t* cnt, uint32_t* cap) {
+    if (!f_raw || !wnodes || ref_count == 0) return;
+
+    uint16_t nlen = name ? (uint16_t)strlen(name) : 0;
+    uint16_t plen = pcode ? (uint16_t)strlen(pcode) : 0;
+    uint8_t area_flag = is_area ? 1 : 0;
+
+    if (*cnt >= *cap) {
+        // Use smaller additive steps (500k = 8MB) when large so 32-bit LAA heap never fails to find a contiguous block
+        uint32_t step = (*cap < 2000000) ? (*cap == 0 ? 250000 : *cap) : 1000000;
+        uint32_t new_cap = *cap + step;
+        SortEntry* safe = realloc(*entries, (size_t)new_cap * sizeof(SortEntry));
+        if (!safe && step > 100000) {
+            new_cap = *cap + 100000;
+            safe = realloc(*entries, (size_t)new_cap * sizeof(SortEntry));
+        }
+        if (safe) {
+            *entries = safe;
+            *cap = new_cap;
+        } else {
+            return;
+        }
+    }
+
+    uint32_t total_len = 1 + 1 + 2 + nlen + 2 + plen + 4 + (ref_count * sizeof(WayNode));
+    int64_t raw_pos = FTELL64(f_raw);
+    if (raw_pos < 0) {
+        FSEEK64(f_raw, 0, SEEK_END);
+        raw_pos = FTELL64(f_raw);
+        if (raw_pos < 0) return;
+    }
+    uint64_t offset = (uint64_t)raw_pos;
+
+    fwrite(&total_len, 4, 1, f_raw);
+    fwrite(&fc, 1, 1, f_raw);
+    fwrite(&area_flag, 1, 1, f_raw);
+    fwrite(&nlen, 2, 1, f_raw);
+    if (nlen > 0) fwrite(name, 1, nlen, f_raw);
+    fwrite(&plen, 2, 1, f_raw);
+    if (plen > 0) fwrite(pcode, 1, plen, f_raw);
+    fwrite(&ref_count, 4, 1, f_raw);
+    fwrite(wnodes, sizeof(WayNode), ref_count, f_raw);
+
+    double min_lon = wnodes[0].lon, max_lon = wnodes[0].lon;
+    double min_lat = wnodes[0].lat, max_lat = wnodes[0].lat;
+    for (uint32_t i = 1; i < ref_count; i++) {
+        if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon;
+        if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
+        if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat;
+        if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
+    }
+
+    double cx = (min_lon + max_lon) / 2.0;
+    double cy = (min_lat + max_lat) / 2.0;
+    int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF);
+    int32_t c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
+
+    (*entries)[*cnt].morton = EncodeLayeredMorton(fc, c_ix, c_iy);
+    (*entries)[*cnt].offset = offset;
+    (*cnt)++;
+}
+
+static bool IsValidCoordPair(const char* s_lat, const char* s_lon, double* out_lat, double* out_lon) {
+    if (!s_lat || !s_lon || !*s_lat || !*s_lon) return false;
+    if (!strchr(s_lat, '.') && !strchr(s_lon, '.')) return false;
+    char* end_lat = NULL;
+    char* end_lon = NULL;
+    double lat = strtod(s_lat, &end_lat);
+    double lon = strtod(s_lon, &end_lon);
+    if (end_lat == s_lat || end_lon == s_lon) return false;
+    if (lat == 0.0 && lon == 0.0) return false;
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) return false;
+    *out_lat = lat;
+    *out_lon = lon;
+    return true;
 }
 
 static int MergeQJMFiles(const char* qjm_pass1, const char* qjm_pass2, const char* out_filename) {
@@ -203,56 +350,20 @@ static int MergeQJMFiles(const char* qjm_pass1, const char* qjm_pass2, const cha
     return 0;
 }
 
-static void WriteRawFeature(FILE* f_raw, WayNode* wnodes, uint32_t ref_count, bool is_area, const char* name, const char* pcode, uint8_t fc, SortEntry** entries, uint64_t* cnt, uint32_t* cap) {
-    if (!f_raw || !wnodes || ref_count == 0) return;
-
-    uint16_t nlen = name ? (uint16_t)strlen(name) : 0;
-    uint16_t plen = pcode ? (uint16_t)strlen(pcode) : 0;
-    uint8_t area_flag = is_area ? 1 : 0;
-
-    uint32_t total_len = 1 + 1 + 2 + nlen + 2 + plen + 4 + (ref_count * sizeof(WayNode));
-    uint64_t offset = FTELL64(f_raw);
-
-    fwrite(&total_len, 4, 1, f_raw);
-    fwrite(&fc, 1, 1, f_raw);
-    fwrite(&area_flag, 1, 1, f_raw);
-    fwrite(&nlen, 2, 1, f_raw);
-    if (nlen > 0) fwrite(name, 1, nlen, f_raw);
-    fwrite(&plen, 2, 1, f_raw);
-    if (plen > 0) fwrite(pcode, 1, plen, f_raw);
-    fwrite(&ref_count, 4, 1, f_raw);
-    fwrite(wnodes, sizeof(WayNode), ref_count, f_raw);
-
-    double min_lon = wnodes[0].lon, max_lon = wnodes[0].lon;
-    double min_lat = wnodes[0].lat, max_lat = wnodes[0].lat;
-    for (uint32_t i = 1; i < ref_count; i++) {
-        if (wnodes[i].lon < min_lon) min_lon = wnodes[i].lon;
-        if (wnodes[i].lon > max_lon) max_lon = wnodes[i].lon;
-        if (wnodes[i].lat < min_lat) min_lat = wnodes[i].lat;
-        if (wnodes[i].lat > max_lat) max_lat = wnodes[i].lat;
-    }
-
-    double cx = (min_lon + max_lon) / 2.0;
-    double cy = (min_lat + max_lat) / 2.0;
-    int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF);
-    int32_t c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
-
-    if (*cnt >= *cap) {
-        // Use additive growth for massive numbers to avoid 1GB 32-bit contiguous alloc crashes
-        uint32_t new_cap = (*cap < 2000000) ? (*cap == 0 ? 250000 : *cap * 2) : (*cap + 2000000);
-        SortEntry* safe = realloc(*entries, new_cap * sizeof(SortEntry));
-        if (safe) {
-            *entries = safe;
-            *cap = new_cap;
-        } else {
-            return; // Fail gracefully rather than hard crash
+static void NormalizePostalCode(const char* in_str, char* out_str, size_t max_len) {
+    size_t j = 0;
+    for (size_t i = 0; in_str[i] != '\0' && j < max_len - 1; i++) {
+        char c = in_str[i];
+        if (c == ' ' || c == '\t' || c == '"') {
+            // Keep single internal space for Canadian 6-char postcodes if desired, or strip leading/trailing
+            if (j == 0 || in_str[i + 1] == '\0' || in_str[i + 1] == ' ') continue;
         }
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out_str[j++] = c;
     }
-    
-    (*entries)[*cnt].morton = EncodeLayeredMorton(fc, c_ix, c_iy);
-    (*entries)[*cnt].offset = offset;
-    (*cnt)++;
+    out_str[j] = '\0';
 }
+
 static void SetStatus(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -264,163 +375,252 @@ static void SetStatus(const char* fmt, ...) {
 }
 
 static void ProcessPostalCodeCSVs(const char* file_list, const char* raw_tmp_name, SortEntry** entries, uint64_t* cnt, uint32_t* cap, bool has_bbox, double b_minLon, double b_minLat, double b_maxLon, double b_maxLat) {
-    char list_copy[32768];
-    strncpy(list_copy, file_list, sizeof(list_copy)-1);
-    list_copy[sizeof(list_copy)-1] = '\0';
-    
-    uint32_t csv_cap = 65536;
+    if (!file_list || !*file_list) return;
+
+    char* list_copy = malloc(32768);
+    if (!list_copy) return;
+    strncpy(list_copy, file_list, 32767);
+    list_copy[32767] = '\0';
+
+    uint32_t csv_cap = 262144;
     uint32_t csv_cnt = 0;
     CsvPcode* csv_arr = malloc(csv_cap * sizeof(CsvPcode));
-    if (!csv_arr) return;
+    if (!csv_arr) {
+        free(list_copy);
+        return;
+    }
 
-    char* file_path = strtok(list_copy, ";");
-    while (file_path) {
-        while (*file_path == ' ') file_path++;
-        FILE* f = fopen(file_path, "r");
-        if (f) {
-            SetStatus("Processing Postal Codes from: %s", file_path);
-            char line[2048];
-            bool is_first = true;
-            int col_pcode = -1, col_lat = -1, col_lon = -1;
-            
-            while (fgets(line, sizeof(line), f)) {
-                char* p = line;
-                while (*p) { if (*p == '\r' || *p == '\n') *p = '\0'; p++; }
-                if (strlen(line) == 0) continue;
-                
-                char* cols[64]; int num_cols = 0;
-                char sep = strchr(line, '\t') ? '\t' : ','; 
-                char* token = line;
-                while (token && num_cols < 64) {
-                    char* next = strchr(token, sep);
-                    if (next) { *next = '\0'; cols[num_cols++] = token; token = next + 1; }
-                    else { cols[num_cols++] = token; break; }
-                }
-                
-                if (is_first) {
-                    is_first = false;
-                    bool has_header = false;
-                    for (int c = 0; c < num_cols; c++) {
-                        if (FindSubStringIC(cols[c], "PostalCode") || FindSubStringIC(cols[c], "Latitude") || FindSubStringIC(cols[c], "FSA") || FindSubStringIC(cols[c], "Place Name") || FindSubStringIC(cols[c], "FSA1") || FindSubStringIC(cols[c], "FSA-Province") || FindSubStringIC(cols[c], "AreaType")) {
-                            has_header = true; break;
-                        }
-                    }
-                    if (has_header) {
-                        for (int c = 0; c < num_cols; c++) {
-                            if (FindSubStringIC(cols[c], "PostalCode") || FindSubStringIC(cols[c], "FSA") || FindSubStringIC(cols[c], "FSA1")) { if (col_pcode == -1) col_pcode = c; }
-                            else if (FindSubStringIC(cols[c], "Latitude")) col_lat = c;
-                            else if (FindSubStringIC(cols[c], "Longitude")) col_lon = c;
-                        }
-                        continue;
-                    } else {
-                        if (num_cols >= 9 && strchr(cols[7], '.') && strchr(cols[8], '.')) {
-                            col_pcode = 1; col_lat = 7; col_lon = 8;
-                        } else if (num_cols >= 4 && strchr(cols[2], '.') && strchr(cols[3], '.')) {
-                            col_pcode = 0; col_lat = 2; col_lon = 3;
-                        } else {
-                            for(int c=0; c<num_cols; c++) {
-                                if (strchr(cols[c], '.')) {
-                                    if (col_lat == -1) col_lat = c;
-                                    else if (col_lon == -1) col_lon = c;
-                                }
-                            }
-                            if (col_pcode == -1) col_pcode = 0;
-                        }
-                    }
-                }
-                
-                if (col_pcode >= 0 && col_lat >= 0 && col_lon >= 0 && col_pcode < num_cols && col_lat < num_cols && col_lon < num_cols) {
-                    double lat = atof(cols[col_lat]);
-                    double lon = atof(cols[col_lon]);
-                    if (has_bbox && (lon < b_minLon || lon > b_maxLon || lat < b_minLat || lat > b_maxLat)) continue;
-                    
-                    char* pcode = cols[col_pcode];
-                    if (!pcode || strlen(pcode) == 0) continue;
+    uint32_t files_processed = 0;
+    char* cursor = list_copy;
 
-                    if (csv_cnt >= csv_cap) {
-                        csv_cap *= 2;
-                        CsvPcode* safe = realloc(csv_arr, csv_cap * sizeof(CsvPcode));
-                        if (!safe) break;
-                        csv_arr = safe;
-                    }
-                    
-                    strncpy(csv_arr[csv_cnt].pcode, pcode, 15);
-                    csv_arr[csv_cnt].pcode[15] = '\0';
-                    csv_arr[csv_cnt].lat = lat;
-                    csv_arr[csv_cnt].lon = lon;
-                    csv_cnt++;
+    while (cursor && *cursor) {
+        char* next_semi = strchr(cursor, ';');
+        if (next_semi) *next_semi = '\0';
+
+        char* file_path = TrimCsvToken(cursor);
+        cursor = next_semi ? (next_semi + 1) : NULL;
+
+        if (!file_path || !*file_path) continue;
+
+        FILE* f = fopen(file_path, "rb");
+        if (!f) {
+            SetStatus("Warning: Cannot open postal code file: %s", file_path);
+            continue;
+        }
+
+        files_processed++;
+        uint32_t file_start_cnt = csv_cnt;
+        char* io_buf = malloc(IO_BUF_SIZE);
+        if (io_buf) setvbuf(f, io_buf, _IOFBF, IO_BUF_SIZE);
+
+        SetStatus("Processing Postal Codes (File %u): %s", files_processed, file_path);
+
+        char line[4096];
+        bool is_first_line = true;
+        int col_pcode = -1, col_lat = -1, col_lon = -1;
+
+        while (fgets(line, sizeof(line), f)) {
+            char* p = line;
+            if (is_first_line && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
+                p += 3;
+            }
+            char* start_line = p;
+            while (*p) {
+                if (*p == '\r' || *p == '\n') *p = '\0';
+                p++;
+            }
+            if (start_line[0] == '\0') continue;
+
+            char* cols[64];
+            int num_cols = 0;
+            bool is_tab = (strchr(start_line, '\t') != NULL);
+            char sep = is_tab ? '\t' : ',';
+            char* token = start_line;
+
+            while (token && num_cols < 64) {
+                char* next = NULL;
+                if (!is_tab && *token == '"') {
+                    char* q = token + 1;
+                    while (*q && !(*q == '"' && (q[1] == sep || q[1] == '\0'))) q++;
+                    if (*q == '"') next = (q[1] == sep) ? (q + 1) : NULL;
+                } else {
+                    next = strchr(token, sep);
+                }
+                if (next) {
+                    *next = '\0';
+                    cols[num_cols++] = TrimCsvToken(token);
+                    token = next + 1;
+                } else {
+                    cols[num_cols++] = TrimCsvToken(token);
+                    break;
                 }
             }
-            fclose(f);
+
+            if (num_cols < 3) continue;
+
+            if (is_first_line) {
+                is_first_line = false;
+                bool has_header = false;
+                for (int c = 0; c < num_cols; c++) {
+                    if (FindSubStringIC(cols[c], "Postal") || FindSubStringIC(cols[c], "Postcode") ||
+                        FindSubStringIC(cols[c], "Zip") || FindSubStringIC(cols[c], "Latitude") ||
+                        FindSubStringIC(cols[c], "FSA") || FindSubStringIC(cols[c], "Place Name") ||
+                        FindSubStringIC(cols[c], "AreaType")) {
+                        has_header = true;
+                        break;
+                    }
+                }
+                if (has_header) {
+                    for (int c = 0; c < num_cols; c++) {
+                        if (col_pcode == -1 && (FindSubStringIC(cols[c], "Postal") || FindSubStringIC(cols[c], "Postcode") || FindSubStringIC(cols[c], "Zip") || FindSubStringIC(cols[c], "FSA"))) {
+                            col_pcode = c;
+                        } else if (col_lat == -1 && (FindSubStringIC(cols[c], "Latitude") || strcasecmp(cols[c], "lat") == 0)) {
+                            col_lat = c;
+                        } else if (col_lon == -1 && (FindSubStringIC(cols[c], "Longitude") || FindSubStringIC(cols[c], "Lng") || strcasecmp(cols[c], "lon") == 0 || strcasecmp(cols[c], "long") == 0)) {
+                            col_lon = c;
+                        }
+                    }
+                    if (col_pcode == -1) col_pcode = 0;
+                    if (col_lat == -1) col_lat = 2;
+                    if (col_lon == -1) col_lon = 3;
+                    continue; // Skip header row and read data rows
+                } else {
+                    // Headerless file (e.g. US GeoNames TSV or headerless Canadian CSV)
+                    // Detect whether column 0 is a 2-letter country code (e.g. "US" or "CA")
+                    if (IsTwoLetterCountry(cols[0]) && num_cols > 1 && cols[1][0] != '\0') {
+                        col_pcode = 1;
+                    } else {
+                        col_pcode = 0;
+                    }
+                    for (int c = 0; c < num_cols - 1; c++) {
+                        double t_lat = 0.0, t_lon = 0.0;
+                        if (IsValidLatLonPair(cols[c], cols[c + 1], &t_lat, &t_lon)) {
+                            col_lat = c;
+                            col_lon = c + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            int use_pcode_col = col_pcode;
+            if (use_pcode_col < 0 || use_pcode_col >= num_cols) {
+                use_pcode_col = (IsTwoLetterCountry(cols[0]) && num_cols > 1) ? 1 : 0;
+            }
+            char* raw_pcode = cols[use_pcode_col];
+            if (!raw_pcode || raw_pcode[0] == '\0') continue;
+
+            double lat = 0.0, lon = 0.0;
+            bool valid_coords = false;
+
+            if (col_lat >= 0 && col_lon >= 0 && col_lat < num_cols && col_lon < num_cols) {
+                valid_coords = IsValidLatLonPair(cols[col_lat], cols[col_lon], &lat, &lon);
+            }
+            // If empty columns shifted indices on this row, scan right-to-left for the (lat, lon) decimal pair
+            if (!valid_coords) {
+                for (int c = num_cols - 2; c >= 1; c--) {
+                    if (IsValidLatLonPair(cols[c], cols[c + 1], &lat, &lon)) {
+                        valid_coords = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!valid_coords) continue;
+            if (has_bbox && (lon < b_minLon || lon > b_maxLon || lat < b_minLat || lat > b_maxLat)) continue;
+
+            if (csv_cnt >= csv_cap) {
+                uint32_t new_cap = (csv_cap < 1000000) ? (csv_cap * 2) : (csv_cap + 500000);
+                CsvPcode* safe = realloc(csv_arr, (size_t)new_cap * sizeof(CsvPcode));
+                if (!safe) break;
+                csv_arr = safe;
+                csv_cap = new_cap;
+            }
+
+            NormalizePostalCode(raw_pcode, csv_arr[csv_cnt].pcode, sizeof(csv_arr[csv_cnt].pcode));
+            if (csv_arr[csv_cnt].pcode[0] == '\0') continue;
+
+            csv_arr[csv_cnt].lat = lat;
+            csv_arr[csv_cnt].lon = lon;
+            csv_cnt++;
         }
-        file_path = strtok(NULL, ";");
+
+        fclose(f);
+        if (io_buf) free(io_buf);
+        SetStatus("Imported %u postal codes from %s (Total: %u)", csv_cnt - file_start_cnt, file_path, csv_cnt);
     }
+
+    free(list_copy);
 
     if (csv_cnt == 0) {
         free(csv_arr);
         return;
     }
 
-    SetStatus("Sorting and deduplicating %u CSV postal codes...", csv_cnt);
+    SetStatus("Sorting and deduplicating %u postal codes across %u file(s)...", csv_cnt, files_processed);
     qsort(csv_arr, csv_cnt, sizeof(CsvPcode), CompareCsvPcode);
-    
+
     uint32_t unique_cnt = 0;
     for (uint32_t i = 0; i < csv_cnt; i++) {
-        if (i > 0 && strcmp(csv_arr[i].pcode, csv_arr[unique_cnt - 1].pcode) == 0) continue;
+        if (unique_cnt > 0 && strcmp(csv_arr[i].pcode, csv_arr[unique_cnt - 1].pcode) == 0) continue;
         csv_arr[unique_cnt++] = csv_arr[i];
     }
     csv_cnt = unique_cnt;
 
-    SetStatus("Stripping overridden postal codes from PBF data...");
-    FILE* f_mod = fopen(raw_tmp_name, "r+b");
-    if (f_mod) {
-        for (uint64_t i = 0; i < *cnt; i++) {
-            uint64_t offset = (*entries)[i].offset;
-            FSEEK64(f_mod, offset, SEEK_SET);
-            
-            uint32_t total_len;
-            if (fread(&total_len, 4, 1, f_mod) != 1) continue;
-            
-            uint8_t fc, area;
-            fread(&fc, 1, 1, f_mod);
-            fread(&area, 1, 1, f_mod);
-            
-            uint16_t nlen;
-            fread(&nlen, 2, 1, f_mod);
-            if (nlen > 0) FSEEK64(f_mod, nlen, SEEK_CUR);
-            
-            uint16_t plen;
-            fread(&plen, 2, 1, f_mod);
-            
-            if (plen > 0 && plen < 16) {
-                uint64_t pcode_pos = FTELL64(f_mod);
-                char pcode[16] = {0};
-                fread(pcode, 1, plen, f_mod);
-                pcode[plen] = '\0';
-                
-                int l = 0, r = csv_cnt - 1;
-                bool is_dup = false;
-                while (l <= r) {
-                    int m = l + (r - l) / 2;
-                    int cmp = strcmp(csv_arr[m].pcode, pcode);
-                    if (cmp == 0) { is_dup = true; break; }
-                    if (cmp < 0) l = m + 1;
-                    else r = m - 1;
-                }
-                
-                if (is_dup) {
-                    FSEEK64(f_mod, pcode_pos, SEEK_SET);
-                    char zeros[16] = {0};
-                    fwrite(zeros, 1, plen, f_mod);
+    if (g_CfgPcode && *cnt > 0) {
+        SetStatus("Stripping overridden postal codes from PBF data...");
+        FILE* f_mod = fopen(raw_tmp_name, "r+b");
+        if (f_mod) {
+            for (uint64_t i = 0; i < *cnt; i++) {
+                uint64_t offset = (*entries)[i].offset;
+                if (FSEEK64(f_mod, (int64_t)offset, SEEK_SET) != 0) continue;
+
+                uint8_t hdr[8];
+                if (fread(hdr, 1, 8, f_mod) != 8) continue;
+                uint16_t nlen = *(uint16_t*)(hdr + 6);
+                if (nlen > 0 && FSEEK64(f_mod, nlen, SEEK_CUR) != 0) continue;
+
+                uint16_t plen = 0;
+                if (fread(&plen, 2, 1, f_mod) != 1) continue;
+
+                if (plen > 0 && plen < 16) {
+                    int64_t pcode_pos = FTELL64(f_mod);
+                    char raw_p[16] = {0}, norm_p[16] = {0};
+                    if (fread(raw_p, 1, plen, f_mod) != plen) continue;
+                    raw_p[plen] = '\0';
+                    NormalizePostalCode(raw_p, norm_p, sizeof(norm_p));
+
+                    int l = 0, r = (int)csv_cnt - 1;
+                    bool is_dup = false;
+                    while (l <= r) {
+                        int m = l + (r - l) / 2;
+                        int cmp = strcmp(csv_arr[m].pcode, norm_p);
+                        if (cmp == 0) { is_dup = true; break; }
+                        if (cmp < 0) l = m + 1;
+                        else r = m - 1;
+                    }
+
+                    if (is_dup && pcode_pos > 0) {
+                        FSEEK64(f_mod, pcode_pos, SEEK_SET);
+                        char zeros[16] = {0};
+                        fwrite(zeros, 1, plen, f_mod);
+                        fflush(f_mod);
+                    }
                 }
             }
+            fclose(f_mod);
         }
-        fclose(f_mod);
     }
 
-    SetStatus("Appending %u unified CSV postal codes...", csv_cnt);
-    FILE* f_app = fopen(raw_tmp_name, "ab");
+    SetStatus("Appending %u unified postal codes...", csv_cnt);
+    FILE* f_app = fopen(raw_tmp_name, "r+b");
+    if (!f_app) f_app = fopen(raw_tmp_name, "wb");
     if (f_app) {
+        char* app_buf = malloc(IO_BUF_SIZE);
+        if (app_buf) setvbuf(f_app, app_buf, _IOFBF, IO_BUF_SIZE);
+
+        FSEEK64(f_app, 0, SEEK_END);
+
         for (uint32_t i = 0; i < csv_cnt; i++) {
             WayNode wn;
             wn.id = 1;
@@ -428,12 +628,13 @@ static void ProcessPostalCodeCSVs(const char* file_list, const char* raw_tmp_nam
             wn.lon = csv_arr[i].lon;
             WriteRawFeature(f_app, &wn, 1, false, NULL, csv_arr[i].pcode, CLASS_PLACE, entries, cnt, cap);
         }
+        fflush(f_app);
         fclose(f_app);
+        if (app_buf) free(app_buf);
     }
-    
+
     free(csv_arr);
 }
-
 static WayNode* ClipPolygonAABB(WayNode* in_nodes, uint32_t in_cnt, double min_x, double min_y, double max_x, double max_y, uint32_t* out_cnt, PolyAABB* out_box) {
     *out_cnt = 0;
     if (!in_nodes || in_cnt < 3) return NULL;
@@ -1610,9 +1811,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
     bool orig_Land = g_CfgLand, orig_Coast = g_CfgCoast;
     bool orig_HwyMain = g_CfgHwyMain, orig_HwyMin = g_CfgHwyMin;
     bool orig_Water = g_CfgWater, orig_Park = g_CfgPark;
+    bool orig_Pcode = g_CfgPcode;
+    bool has_csv = (g_CsvFiles[0] != '\0');
 
     bool want_land_coast = (orig_Land || orig_Coast);
-    bool want_rest = (orig_HwyMain || orig_HwyMin || orig_Water || orig_Park);
+    bool want_rest = (orig_HwyMain || orig_HwyMin || orig_Water || orig_Park || orig_Pcode || has_csv);
     bool two_pass_mode = (!is_main_input_shp && want_land_coast && want_rest);
     int total_passes = two_pass_mode ? 2 : 1;
 
@@ -1643,6 +1846,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                 g_CfgHwyMin = false;
                 g_CfgWater = false;
                 g_CfgPark = false;
+                g_CfgPcode = false;
             } else {
                 cur_out_file = pass2_qjm;
                 use_water_shp = false;
@@ -1652,6 +1856,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                 g_CfgHwyMin = orig_HwyMin;
                 g_CfgWater = orig_Water;
                 g_CfgPark = orig_Park;
+                g_CfgPcode = orig_Pcode;
             }
         }
 
@@ -1680,7 +1885,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     FSEEK64(f_raw, 0, SEEK_SET);
                     uint32_t r_cap = 65536; WayNode* wnodes = malloc(r_cap * sizeof(WayNode));
                     while (FTELL64(f_raw) < raw_sz - 4) {
-                        uint64_t offset = FTELL64(f_raw); uint32_t total_len;
+                        uint64_t offset = (uint64_t)FTELL64(f_raw); uint32_t total_len;
                         if (fread(&total_len, 4, 1, f_raw) != 1) break;
 
                         uint8_t fc, area_flag; uint16_t nlen, plen;
@@ -1700,8 +1905,9 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         double cx = (min_lon + max_lon) / 2.0, cy = (min_lat + max_lat) / 2.0;
                         int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF), c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
                         if (written_feats >= feature_capacity) { 
-                            feature_capacity = (feature_capacity < 2000000) ? (feature_capacity * 2) : (feature_capacity + 2000000);
-                            SortEntry* safe = realloc(sort_entries, feature_capacity * sizeof(SortEntry));
+                            uint32_t step = (feature_capacity < 2000000) ? feature_capacity : 1000000;
+                            feature_capacity += step;
+                            SortEntry* safe = realloc(sort_entries, (size_t)feature_capacity * sizeof(SortEntry));
                             if (safe) sort_entries = safe; else break;
                         }
                         sort_entries[written_feats].morton = EncodeLayeredMorton(fc, c_ix, c_iy);
@@ -1732,7 +1938,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (f_raw) {
                         uint32_t r_cap = 65536; WayNode* wnodes = malloc(r_cap * sizeof(WayNode));
                         while (FTELL64(f_raw) < safe_raw_sz) {
-                            uint64_t offset = FTELL64(f_raw); uint32_t total_len;
+                            uint64_t offset = (uint64_t)FTELL64(f_raw); uint32_t total_len;
                             if (fread(&total_len, 4, 1, f_raw) != 1) break;
                             uint8_t fc, area_flag; uint16_t nlen, plen;
                             fread(&fc, 1, 1, f_raw); fread(&area_flag, 1, 1, f_raw); fread(&nlen, 2, 1, f_raw);
@@ -1764,8 +1970,9 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             int32_t c_ix = (int32_t)((cx + 180.0) / 360.0 * 0x3FFFFFFF), c_iy = (int32_t)((cy + 90.0) / 180.0 * 0x3FFFFFFF);
                             
                             if (written_feats >= feature_capacity) { 
-                                feature_capacity = (feature_capacity < 2000000) ? (feature_capacity * 2) : (feature_capacity + 2000000);
-                                SortEntry* safe = realloc(sort_entries, feature_capacity * sizeof(SortEntry));
+                                uint32_t step = (feature_capacity < 2000000) ? feature_capacity : 1000000;
+                                feature_capacity += step;
+                                SortEntry* safe = realloc(sort_entries, (size_t)feature_capacity * sizeof(SortEntry));
                                 if (safe) sort_entries = safe; else break;
                             }
                             sort_entries[written_feats].morton = EncodeLayeredMorton(fc, c_ix, c_iy);
@@ -1788,7 +1995,8 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         free(buf); fclose(f_old); fclose(f_new);
                         remove(raw_tmp_name); rename("temp_truncate.tmp", raw_tmp_name);
                     }
-                    f_raw = fopen(raw_tmp_name, "ab");
+                    f_raw = fopen(raw_tmp_name, "r+b");
+                    if (f_raw) FSEEK64(f_raw, 0, SEEK_END);
 
                     uint32_t open_cnt = 0;
                     coast_cap = 65536;
@@ -1862,16 +2070,18 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                 f_raw = fopen(raw_tmp_name, "wb");
                 if (!f_raw) {
                     free(road_samples); free(sort_entries);
-                    g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+                    g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
                     return 1;
                 }
                 ProcessShapefile(in_filename, f_raw, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
                 
                 if (!two_pass_mode || qjm_pass == 2) {
                     if (g_CsvFiles[0] != '\0') {
+                        fflush(f_raw);
                         fclose(f_raw);
                         ProcessPostalCodeCSVs(g_CsvFiles, raw_tmp_name, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
-                        f_raw = fopen(raw_tmp_name, "ab");
+                        f_raw = fopen(raw_tmp_name, "r+b");
+                        if (f_raw) FSEEK64(f_raw, 0, SEEK_END);
                     }
                 }
                 
@@ -1923,7 +2133,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             FILE* file = fopen(in_filename, "rb");
                             if (!file) {
                                 if (tmpOut) fclose(tmpOut); if (io_buf) free(io_buf); free(road_samples); free(sort_entries);
-                                g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+                                g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
                                 return 1;
                             }
 
@@ -1988,7 +2198,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         FILE* fnodes = fopen(nodes_tmp_name, "rb");
                         if (!fnodes) {
                             free(road_samples); free(sort_entries);
-                            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+                            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
                             return 1;
                         }
                         char* io_node_buf = malloc(IO_BUF_SIZE); if (io_node_buf) setvbuf(fnodes, io_node_buf, _IOFBF, IO_BUF_SIZE);
@@ -1997,7 +2207,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                         PbfNode* chunk = malloc(CHUNK_NODES * sizeof(PbfNode));
                         if (!chunk) {
                             fclose(fnodes); if (io_node_buf) free(io_node_buf); free(road_samples); free(sort_entries);
-                            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+                            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
                             return 1;
                         }
 
@@ -2118,7 +2328,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                     if (fways && io_final_in) setvbuf(fways, io_final_in, _IOFBF, IO_BUF_SIZE);
                     if (!fways || !f_raw) {
                         if (io_final_in) free(io_final_in); free(road_samples); free(sort_entries);
-                        g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+                        g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
                         return 1;
                     }
 
@@ -2143,7 +2353,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
                             }
                         }
 
-                        if (valid_cnt >= 2) {
+                        if (valid_cnt >= 2 || (valid_cnt == 1 && (fc == CLASS_PLACE || fc == CLASS_POI))) {
                             ref_count = valid_cnt;
 
                             if (fc == CLASS_HWY_MAIN || fc == CLASS_HWY_MINOR) {
@@ -2347,9 +2557,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
 
                 if (!two_pass_mode || qjm_pass == 2) {
                     if (g_CsvFiles[0] != '\0') {
+                        fflush(f_raw);
                         fclose(f_raw);
                         ProcessPostalCodeCSVs(g_CsvFiles, raw_tmp_name, &sort_entries, &written_feats, &feature_capacity, has_bbox, b_minLon, b_minLat, b_maxLon, b_maxLat);
-                        f_raw = fopen(raw_tmp_name, "ab");
+                        f_raw = fopen(raw_tmp_name, "r+b");
+                        if (f_raw) FSEEK64(f_raw, 0, SEEK_END);
                     }
                 }
 
@@ -2369,7 +2581,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         if (!f_qjmc) {
             free(sort_entries);
             if (f_raw) fclose(f_raw);
-            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+            g_CfgLand = orig_Land; g_CfgCoast = orig_Coast; g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin; g_CfgWater = orig_Water; g_CfgPark = orig_Park; g_CfgPcode = orig_Pcode;
             return 1;
         }
         fwrite("QJMC", 1, 4, f_qjmc);
@@ -2389,8 +2601,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         uint8_t last_fc = 0xFF;
 
         for (uint64_t i = 0; i < written_feats; i++) {
-            FSEEK64(f_raw, sort_entries[i].offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
-            if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); } fread(raw_buf, 1, total_len, f_raw);
+            if (FSEEK64(f_raw, (int64_t)sort_entries[i].offset, SEEK_SET) != 0) continue;
+            uint32_t total_len = 0;
+            if (fread(&total_len, 4, 1, f_raw) != 1) continue;
+            if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); }
+            if (fread(raw_buf, 1, total_len, f_raw) != total_len) continue;
 
             uint8_t* rptr = raw_buf; uint8_t fc = *rptr++; uint8_t is_area = *rptr++;
             uint16_t nlen = *(uint16_t*)rptr; rptr += 2; char* name = nlen ? (char*)rptr : NULL; rptr += nlen;
@@ -2484,8 +2699,11 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
         last_fc = 0xFF;
 
         for (uint64_t i = 0; i < written_feats; i++) {
-            FSEEK64(f_raw, sort_entries[i].offset, SEEK_SET); uint32_t total_len; fread(&total_len, 4, 1, f_raw);
-            if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); } fread(raw_buf, 1, total_len, f_raw);
+            if (FSEEK64(f_raw, (int64_t)sort_entries[i].offset, SEEK_SET) != 0) continue;
+            uint32_t total_len = 0;
+            if (fread(&total_len, 4, 1, f_raw) != 1) continue;
+            if (total_len > raw_cap) { raw_cap = total_len + 65536; raw_buf = realloc(raw_buf, raw_cap); }
+            if (fread(raw_buf, 1, total_len, f_raw) != total_len) continue;
 
             uint8_t* rptr = raw_buf; uint8_t fc = *rptr++; uint8_t is_area = *rptr++;
             uint16_t nlen = *(uint16_t*)rptr; rptr += 2; char* name = nlen ? (char*)rptr : NULL; rptr += nlen;
@@ -2607,6 +2825,7 @@ static int RunCompilation(const char* in_filename, const char* out_filename, con
     g_CfgLand = orig_Land; g_CfgCoast = orig_Coast;
     g_CfgHwyMain = orig_HwyMain; g_CfgHwyMin = orig_HwyMin;
     g_CfgWater = orig_Water; g_CfgPark = orig_Park;
+    g_CfgPcode = orig_Pcode;
 
     if (two_pass_mode) {
         SetStatus("Merging Pass 1 and Pass 2 into %s...", out_filename);
@@ -2646,169 +2865,198 @@ return 0;
 
 static BOOL CALLBACK SetFontProc(HWND hwnd, LPARAM lParam) { SendMessageA(hwnd, WM_SETFONT, lParam, TRUE); return TRUE; }
 
-// --- Replace the original CompilerWndProc with this updated version ---
 static LRESULT CALLBACK CompilerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-switch (msg) {
-    case WM_CREATE: {
-        g_hCompilerWnd = hwnd;
-        LoadConfig();
-        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    switch (msg) {
+        case WM_CREATE: {
+            g_hCompilerWnd = hwnd;
+            LoadConfig();
+            HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-        CreateWindowA("STATIC", "Source Map (.pbf, .shp):", WS_VISIBLE|WS_CHILD, 20, 20, 180, 20, hwnd, NULL, NULL, NULL);
-        hTxtIn = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 40, 420, 24, hwnd, NULL, NULL, NULL);
-        hBtnIn = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 40, 90, 24, hwnd, (HMENU)1, NULL, NULL);
+            CreateWindowA("STATIC", "Source Map (.pbf, .shp):", WS_VISIBLE|WS_CHILD, 20, 20, 180, 20, hwnd, NULL, NULL, NULL);
+            hTxtIn = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 40, 420, 24, hwnd, NULL, NULL, NULL);
+            hBtnIn = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 40, 90, 24, hwnd, (HMENU)1, NULL, NULL);
 
-        CreateWindowA("STATIC", "Low Poly Reference Map (.qjm) [Optional]:", WS_VISIBLE|WS_CHILD, 20, 80, 300, 20, hwnd, NULL, NULL, NULL);
-        hTxtRef = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 100, 420, 24, hwnd, NULL, NULL, NULL);
-        hBtnRef = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 100, 90, 24, hwnd, (HMENU)5, NULL, NULL);
+            CreateWindowA("STATIC", "Low Poly Reference Map (.qjm) [Optional]:", WS_VISIBLE|WS_CHILD, 20, 80, 300, 20, hwnd, NULL, NULL, NULL);
+            hTxtRef = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 100, 420, 24, hwnd, NULL, NULL, NULL);
+            hBtnRef = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 100, 90, 24, hwnd, (HMENU)5, NULL, NULL);
 
-        CreateWindowA("STATIC", "Water Polygons Shapefile (.shp) [Optional]:", WS_VISIBLE|WS_CHILD, 20, 140, 320, 20, hwnd, NULL, NULL, NULL);
-        hTxtShp = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_ShapefileFile, WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 160, 420, 24, hwnd, NULL, NULL, NULL);
-        hBtnShp = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 160, 90, 24, hwnd, (HMENU)6, NULL, NULL);
+            CreateWindowA("STATIC", "Water Polygons Shapefile (.shp) [Optional]:", WS_VISIBLE|WS_CHILD, 20, 140, 320, 20, hwnd, NULL, NULL, NULL);
+            hTxtShp = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", g_ShapefileFile, WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 160, 420, 24, hwnd, NULL, NULL, NULL);
+            hBtnShp = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 160, 90, 24, hwnd, (HMENU)6, NULL, NULL);
 
-        CreateWindowA("STATIC", "Output File (.qjm):", WS_VISIBLE|WS_CHILD, 20, 200, 200, 20, hwnd, NULL, NULL, NULL);
-        hTxtOut = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 220, 420, 24, hwnd, NULL, NULL, NULL);
-        hBtnOut = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 220, 90, 24, hwnd, (HMENU)2, NULL, NULL);
-        
-        CreateWindowA("STATIC", "Feature Layers & Retention % (Nodes):", WS_VISIBLE|WS_CHILD, 20, 260, 350, 20, hwnd, NULL, NULL, NULL);
-        
-        hChkLand = CreateWindowA("BUTTON", "Landmass", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 285, 80, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpLand = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 100, 285, 25, 20, hwnd, NULL, NULL, NULL);
+            CreateWindowA("STATIC", "Output File (.qjm):", WS_VISIBLE|WS_CHILD, 20, 200, 200, 20, hwnd, NULL, NULL, NULL);
+            hTxtOut = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 20, 220, 420, 24, hwnd, NULL, NULL, NULL);
+            hBtnOut = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 450, 220, 90, 24, hwnd, (HMENU)2, NULL, NULL);
+            
+            CreateWindowA("STATIC", "Feature Layers & Retention % (Nodes):", WS_VISIBLE|WS_CHILD, 20, 260, 350, 20, hwnd, NULL, NULL, NULL);
+            
+            hChkLand = CreateWindowA("BUTTON", "Landmass", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 285, 80, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpLand = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 100, 285, 25, 20, hwnd, NULL, NULL, NULL);
 
-        hChkHwyMain = CreateWindowA("BUTTON", "Main Roads", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 285, 90, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpHwyMain = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 230, 285, 25, 20, hwnd, NULL, NULL, NULL);
+            hChkHwyMain = CreateWindowA("BUTTON", "Main Roads", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 285, 90, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpHwyMain = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 230, 285, 25, 20, hwnd, NULL, NULL, NULL);
 
-        hChkPark = CreateWindowA("BUTTON", "Parks/Forests", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 270, 285, 105, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpPark = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 375, 285, 25, 20, hwnd, NULL, NULL, NULL);
-        
-        hChkCoast = CreateWindowA("BUTTON", "Coastlines", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 315, 80, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpCoast = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 100, 315, 25, 20, hwnd, NULL, NULL, NULL);
+            hChkPark = CreateWindowA("BUTTON", "Parks/Forests", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 270, 285, 105, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpPark = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 375, 285, 25, 20, hwnd, NULL, NULL, NULL);
+            
+            hChkCoast = CreateWindowA("BUTTON", "Coastlines", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 315, 80, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpCoast = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 100, 315, 25, 20, hwnd, NULL, NULL, NULL);
 
-        hChkHwyMin = CreateWindowA("BUTTON", "Minor Roads", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 315, 90, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpHwyMin = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 230, 315, 25, 20, hwnd, NULL, NULL, NULL);
+            hChkHwyMin = CreateWindowA("BUTTON", "Minor Roads", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 315, 90, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpHwyMin = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 230, 315, 25, 20, hwnd, NULL, NULL, NULL);
 
-        hChkWater = CreateWindowA("BUTTON", "Water Bodies", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 270, 315, 100, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpWater = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 375, 315, 25, 20, hwnd, NULL, NULL, NULL);
+            hChkWater = CreateWindowA("BUTTON", "Water Bodies", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 270, 315, 100, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpWater = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 375, 315, 25, 20, hwnd, NULL, NULL, NULL);
 
-        hChkPcode = CreateWindowA("BUTTON", "Postcodes", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 345, 100, 20, hwnd, NULL, NULL, NULL);
-        hChkSpecs = CreateWindowA("BUTTON", "Specs", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 140, 345, 80, 20, hwnd, NULL, NULL, NULL);
+            hChkPcode = CreateWindowA("BUTTON", "Postcodes", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 345, 90, 20, hwnd, NULL, NULL, NULL);
+            hChkSpecs = CreateWindowA("BUTTON", "Specs", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 115, 345, 65, 20, hwnd, NULL, NULL, NULL);
 
-        CreateWindowA("STATIC", "Postal Code CSV(s):", WS_VISIBLE|WS_CHILD, 230, 345, 120, 20, hwnd, NULL, NULL, NULL);
-        hTxtCsvFiles = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 350, 345, 130, 20, hwnd, NULL, NULL, NULL);
-        hBtnCsv = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 485, 345, 70, 20, hwnd, (HMENU)7, NULL, NULL);
+            CreateWindowA("STATIC", "Postal CSV(s):", WS_VISIBLE|WS_CHILD, 185, 345, 85, 20, hwnd, NULL, NULL, NULL);
+            hTxtCsvFiles = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_VISIBLE|WS_CHILD|ES_AUTOHSCROLL, 270, 345, 210, 20, hwnd, NULL, NULL, NULL);
+            SendMessageA(hTxtCsvFiles, EM_SETLIMITTEXT, 32767, 0);
+            hBtnCsv = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE|WS_CHILD, 485, 345, 70, 20, hwnd, (HMENU)7, NULL, NULL);
 
-        hChkNoRoads = CreateWindowA("BUTTON", "Land/Coast (No Roads)", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 375, 180, 20, hwnd, NULL, NULL, NULL);
-        hTxtSimpNoRoads = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 205, 375, 30, 20, hwnd, NULL, NULL, NULL);
-        
-        SendMessage(hChkLand, BM_SETCHECK, BST_CHECKED, 0); 
-        SendMessage(hChkCoast, BM_SETCHECK, BST_CHECKED, 0);
-        SendMessage(hChkHwyMain, BM_SETCHECK, BST_CHECKED, 0); SendMessage(hChkHwyMin, BM_SETCHECK, BST_CHECKED, 0);
-        SendMessage(hChkPcode, BM_SETCHECK, BST_CHECKED, 0);
-        SendMessage(hChkSpecs, BM_SETCHECK, BST_UNCHECKED, 0); 
-        SendMessage(hChkNoRoads, BM_SETCHECK, BST_CHECKED, 0);
-        
-        hBtnRun = CreateWindowA("BUTTON", "Compile", WS_VISIBLE|WS_CHILD, 20, 410, 340, 35, hwnd, (HMENU)3, NULL, NULL);
-        hBtnDelTmp = CreateWindowA("BUTTON", "Delete Temp Files", WS_VISIBLE|WS_CHILD, 370, 410, 170, 35, hwnd, (HMENU)4, NULL, NULL);
-        hLblStatus = CreateWindowA("STATIC", "Ready.", WS_VISIBLE|WS_CHILD, 20, 455, 520, 20, hwnd, NULL, NULL, NULL);
+            hChkNoRoads = CreateWindowA("BUTTON", "Land/Coast (No Roads)", WS_VISIBLE|WS_CHILD|BS_AUTOCHECKBOX, 20, 375, 180, 20, hwnd, NULL, NULL, NULL);
+            hTxtSimpNoRoads = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "100", WS_VISIBLE|WS_CHILD|ES_NUMBER, 205, 375, 30, 20, hwnd, NULL, NULL, NULL);
+            
+            SendMessage(hChkLand, BM_SETCHECK, BST_CHECKED, 0); 
+            SendMessage(hChkCoast, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessage(hChkHwyMain, BM_SETCHECK, BST_CHECKED, 0); SendMessage(hChkHwyMin, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessage(hChkPcode, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessage(hChkSpecs, BM_SETCHECK, BST_UNCHECKED, 0); 
+            SendMessage(hChkNoRoads, BM_SETCHECK, BST_UNCHECKED, 0);
+            
+            hBtnRun = CreateWindowA("BUTTON", "Compile", WS_VISIBLE|WS_CHILD, 20, 410, 340, 35, hwnd, (HMENU)3, NULL, NULL);
+            hBtnDelTmp = CreateWindowA("BUTTON", "Delete Temp Files", WS_VISIBLE|WS_CHILD, 370, 410, 170, 35, hwnd, (HMENU)4, NULL, NULL);
+            hLblStatus = CreateWindowA("STATIC", "Ready.", WS_VISIBLE|WS_CHILD, 20, 455, 520, 20, hwnd, NULL, NULL, NULL);
 
-        EnumChildWindows(hwnd, SetFontProc, (LPARAM)hFont);
-        DragAcceptFiles(hwnd, TRUE); return 0;
-    }
-    case WM_DROPFILES: {
-        HDROP hDrop = (HDROP)wParam; char filePath[MAX_PATH]; DragQueryFileA(hDrop, 0, filePath, MAX_PATH); DragFinish(hDrop);
-        char* ext = strrchr(filePath, '.');
-        if (ext && (strcasecmp(ext, ".shp") == 0 || strcasecmp(ext, ".pbf") == 0)) AutoFillOutput(filePath);
-        return 0;
-    }
-    case WM_COMMAND: {
-        if (LOWORD(wParam) == 1) { 
-            OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = "Map Files (*.pbf;*.shp)\0*.pbf;*.shp\0PBF Maps\0*.pbf\0Shapefiles\0*.shp\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-            if (GetOpenFileNameA(&ofn)) AutoFillOutput(path);
-        } else if (LOWORD(wParam) == 5) { 
-            OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = "QJM Reference File (*.qjm)\0*.qjm\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-            if (GetOpenFileNameA(&ofn)) SetWindowTextA(hTxtRef, path);
-        } else if (LOWORD(wParam) == 6) { 
-            OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = "Shapefiles (*.shp)\0*.shp\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-            if (GetOpenFileNameA(&ofn)) SetWindowTextA(hTxtShp, path);
-        } else if (LOWORD(wParam) == 7) { 
-            OPENFILENAMEA ofn = {0}; 
-            char path[32768] = ""; 
-            ofn.lStructSize = sizeof(ofn); 
-            ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = "CSV/TXT Files (*.csv;*.txt)\0*.csv;*.txt\0All\0*.*\0"; 
-            ofn.lpstrFile = path; 
-            ofn.nMaxFile = 32768; 
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
-            if (GetOpenFileNameA(&ofn)) {
-                if (path[ofn.nFileOffset - 1] == '\0') {
-                    char outList[32768] = "";
-                    char dir[MAX_PATH];
-                    strcpy(dir, path);
-                    char* file = path + ofn.nFileOffset;
-                    while (*file) {
-                        if (strlen(outList) > 0) strcat(outList, ";");
-                        strcat(outList, dir);
-                        strcat(outList, "\\");
-                        strcat(outList, file);
-                        file += strlen(file) + 1;
-                    }
-                    SetWindowTextA(hTxtCsvFiles, outList);
-                } else {
-                    SetWindowTextA(hTxtCsvFiles, path);
+            EnumChildWindows(hwnd, SetFontProc, (LPARAM)hFont);
+            DragAcceptFiles(hwnd, TRUE); return 0;
+        }
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            UINT file_cnt = DragQueryFileA(hDrop, 0xFFFFFFFF, NULL, 0);
+            char existingCsv[32768] = "";
+            GetWindowTextA(hTxtCsvFiles, existingCsv, sizeof(existingCsv));
+            bool added_csv = false;
+
+            for (UINT i = 0; i < file_cnt; i++) {
+                char filePath[MAX_PATH];
+                DragQueryFileA(hDrop, i, filePath, MAX_PATH);
+                char* ext = strrchr(filePath, '.');
+                if (ext && (strcasecmp(ext, ".shp") == 0 || strcasecmp(ext, ".pbf") == 0)) {
+                    AutoFillOutput(filePath);
+                } else if (ext && (strcasecmp(ext, ".csv") == 0 || strcasecmp(ext, ".txt") == 0)) {
+                    AppendCsvPathToList(existingCsv, sizeof(existingCsv), filePath);
+                    added_csv = true;
                 }
             }
-        } else if (LOWORD(wParam) == 2) { 
-            OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = "QJM Chunked File\0*.qjm\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT;
-            if (GetSaveFileNameA(&ofn)) SetWindowTextA(hTxtOut, path);
-        } else if (LOWORD(wParam) == 3) { 
-            ThreadArgs* args = malloc(sizeof(ThreadArgs));
-            GetWindowTextA(hTxtIn, args->inFile, MAX_PATH); 
-            GetWindowTextA(hTxtOut, args->outFile, MAX_PATH);
-            GetWindowTextA(hTxtRef, args->refFile, MAX_PATH);
-            
-            GetWindowTextA(hTxtShp, g_ShapefileFile, MAX_PATH);
-            WritePrivateProfileStringA("MapData", "CoastlineShapefile", g_ShapefileFile, ".\\pbf2qjm.ini");
-            
-            if (strlen(args->inFile) == 0 || strlen(args->outFile) == 0) { SetStatus("Please specify input and output files."); free(args); return 0; }
-            
-            g_CfgLand = SendMessage(hChkLand, BM_GETCHECK, 0, 0) == BST_CHECKED; 
-            g_CfgCoast = SendMessage(hChkCoast, BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-            g_CfgHwyMain = SendMessage(hChkHwyMain, BM_GETCHECK, 0, 0) == BST_CHECKED; g_CfgHwyMin = SendMessage(hChkHwyMin, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_CfgWater = SendMessage(hChkWater, BM_GETCHECK, 0, 0) == BST_CHECKED; g_CfgPark = SendMessage(hChkPark, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_CfgPcode = SendMessage(hChkPcode, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_CfgSpecs = SendMessage(hChkSpecs, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            g_CfgNoRoads = SendMessage(hChkNoRoads, BM_GETCHECK, 0, 0) == BST_CHECKED;
-
-            char buf[16];
-            GetWindowTextA(hTxtSimpLand, buf, 16); g_SimpLand = atoi(buf);
-            GetWindowTextA(hTxtSimpCoast, buf, 16); g_SimpCoast = atoi(buf);
-            GetWindowTextA(hTxtSimpHwyMain, buf, 16); g_SimpHwyMain = atoi(buf);
-            GetWindowTextA(hTxtSimpHwyMin, buf, 16); g_SimpHwyMin = atoi(buf);
-            GetWindowTextA(hTxtSimpWater, buf, 16); g_SimpWater = atoi(buf);
-            GetWindowTextA(hTxtSimpPark, buf, 16); g_SimpPark = atoi(buf);
-            GetWindowTextA(hTxtSimpNoRoads, buf, 16); g_SimpNoRoads = atoi(buf);
-            
-            GetWindowTextA(hTxtCsvFiles, g_CsvFiles, sizeof(g_CsvFiles));
-
-            CreateThread(NULL, 0, CompileThread, args, 0, NULL);
-        } else if (LOWORD(wParam) == 4) {
-            char outFile[MAX_PATH] = {0};
-            GetWindowTextA(hTxtOut, outFile, MAX_PATH);
-            if (strlen(outFile) == 0) {
-                SetStatus("Specify an Output File (.qjm) first to delete its temp files.");
-            } else {
-                DeleteTempFilesForOutput(outFile);
+            if (added_csv) {
+                SetWindowTextA(hTxtCsvFiles, existingCsv);
+                size_t len = strlen(existingCsv);
+                SendMessageA(hTxtCsvFiles, EM_SETSEL, (WPARAM)len, (LPARAM)len);
             }
-        } break;
-    }
-    case WM_DESTROY: PostQuitMessage(0); return 0;
-} 
-return DefWindowProcA(hwnd, msg, wParam, lParam);
+            DragFinish(hDrop);
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == 1) { 
+                OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "Map Files (*.pbf;*.shp)\0*.pbf;*.shp\0PBF Maps\0*.pbf\0Shapefiles\0*.shp\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+                if (GetOpenFileNameA(&ofn)) AutoFillOutput(path);
+            } else if (LOWORD(wParam) == 5) { 
+                OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "QJM Reference File (*.qjm)\0*.qjm\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+                if (GetOpenFileNameA(&ofn)) SetWindowTextA(hTxtRef, path);
+            } else if (LOWORD(wParam) == 6) { 
+                OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "Shapefiles (*.shp)\0*.shp\0All\0*.*\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+                if (GetOpenFileNameA(&ofn)) SetWindowTextA(hTxtShp, path);
+            } else if (LOWORD(wParam) == 7) { 
+                OPENFILENAMEA ofn = {0}; 
+                char path[32768] = {0}; 
+                ofn.lStructSize = sizeof(ofn); 
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "CSV/TXT Files (*.csv;*.txt)\0*.csv;*.txt\0All\0*.*\0"; 
+                ofn.lpstrFile = path; 
+                ofn.nMaxFile = sizeof(path); 
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+                if (GetOpenFileNameA(&ofn)) {
+                    char outList[32768] = "";
+                    GetWindowTextA(hTxtCsvFiles, outList, sizeof(outList));
+
+                    DWORD attr = GetFileAttributesA(path);
+                    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                        // Multiple files selected: 'path' is directory, followed by null-terminated filenames
+                        char* file = path + strlen(path) + 1;
+                        while (*file) {
+                            char fullPath[MAX_PATH];
+                            if (path[strlen(path) - 1] == '\\') {
+                                snprintf(fullPath, sizeof(fullPath), "%s%s", path, file);
+                            } else {
+                                snprintf(fullPath, sizeof(fullPath), "%s\\%s", path, file);
+                            }
+                            AppendCsvPathToList(outList, sizeof(outList), fullPath);
+                            file += strlen(file) + 1;
+                        }
+                    } else {
+                        // Single file selected: append to existing list separated by ';'
+                        AppendCsvPathToList(outList, sizeof(outList), path);
+                    }
+
+                    SetWindowTextA(hTxtCsvFiles, outList);
+                    size_t len = strlen(outList);
+                    SendMessageA(hTxtCsvFiles, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+                }
+            } else if (LOWORD(wParam) == 2) { 
+                OPENFILENAMEA ofn = {0}; char path[MAX_PATH] = ""; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "QJM Chunked File\0*.qjm\0"; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT;
+                if (GetSaveFileNameA(&ofn)) SetWindowTextA(hTxtOut, path);
+            } else if (LOWORD(wParam) == 3) { 
+                ThreadArgs* args = malloc(sizeof(ThreadArgs));
+                GetWindowTextA(hTxtIn, args->inFile, MAX_PATH); 
+                GetWindowTextA(hTxtOut, args->outFile, MAX_PATH);
+                GetWindowTextA(hTxtRef, args->refFile, MAX_PATH);
+                
+                GetWindowTextA(hTxtShp, g_ShapefileFile, MAX_PATH);
+                WritePrivateProfileStringA("MapData", "CoastlineShapefile", g_ShapefileFile, ".\\pbf2qjm.ini");
+                
+                if (strlen(args->inFile) == 0 || strlen(args->outFile) == 0) { SetStatus("Please specify input and output files."); free(args); return 0; }
+                
+                g_CfgLand = SendMessage(hChkLand, BM_GETCHECK, 0, 0) == BST_CHECKED; 
+                g_CfgCoast = SendMessage(hChkCoast, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+                g_CfgHwyMain = SendMessage(hChkHwyMain, BM_GETCHECK, 0, 0) == BST_CHECKED; g_CfgHwyMin = SendMessage(hChkHwyMin, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_CfgWater = SendMessage(hChkWater, BM_GETCHECK, 0, 0) == BST_CHECKED; g_CfgPark = SendMessage(hChkPark, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_CfgPcode = SendMessage(hChkPcode, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_CfgSpecs = SendMessage(hChkSpecs, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_CfgNoRoads = SendMessage(hChkNoRoads, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+                char buf[16];
+                GetWindowTextA(hTxtSimpLand, buf, 16); g_SimpLand = atoi(buf);
+                GetWindowTextA(hTxtSimpCoast, buf, 16); g_SimpCoast = atoi(buf);
+                GetWindowTextA(hTxtSimpHwyMain, buf, 16); g_SimpHwyMain = atoi(buf);
+                GetWindowTextA(hTxtSimpHwyMin, buf, 16); g_SimpHwyMin = atoi(buf);
+                GetWindowTextA(hTxtSimpWater, buf, 16); g_SimpWater = atoi(buf);
+                GetWindowTextA(hTxtSimpPark, buf, 16); g_SimpPark = atoi(buf);
+                GetWindowTextA(hTxtSimpNoRoads, buf, 16); g_SimpNoRoads = atoi(buf);
+                
+                GetWindowTextA(hTxtCsvFiles, g_CsvFiles, sizeof(g_CsvFiles));
+
+                CreateThread(NULL, 0, CompileThread, args, 0, NULL);
+            } else if (LOWORD(wParam) == 4) {
+                char outFile[MAX_PATH] = {0};
+                GetWindowTextA(hTxtOut, outFile, MAX_PATH);
+                if (strlen(outFile) == 0) {
+                    SetStatus("Specify an Output File (.qjm) first to delete its temp files.");
+                } else {
+                    DeleteTempFilesForOutput(outFile);
+                }
+            } break;
+        }
+        case WM_DESTROY: PostQuitMessage(0); return 0;
+    } 
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
